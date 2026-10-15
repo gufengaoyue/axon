@@ -126,8 +126,9 @@ def test_prompt_mentions_global_memory_tool():
 # ---- ② 会话时长 ----
 
 def test_session_duration_printed_on_exit():
-    assert "本次会话时长" in _CLI_SRC
-    assert "t_session = time.monotonic()" in _CLI_SRC
+    """v0.4.22 起：改为**每回合**页脚显示用时（退出时的会话总时长已按用户要求移除）。"""
+    assert "本次会话时长" not in _CLI_SRC
+    assert "elapsed=time.monotonic() - t_turn" in _CLI_SRC
 
 
 # ---- ③ 思考重放去重 ----

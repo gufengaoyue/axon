@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/gufengaoyue/axon"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-gufengaoyue%2Faxon-181717?logo=github"></a>
   <a href="https://pypi.org/project/ai-agent-axon/"><img alt="PyPI" src="https://img.shields.io/badge/PyPI-ai--agent--axon-3775A9?logo=pypi&logoColor=white"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.4.21-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.22-blue">
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -54,7 +54,7 @@ Axon 是一个**在你的电脑上本地运行**的 AI 智能体。它不是一�
 | ⌨️ **审批独占键盘**   | 沙箱确认期间**暂停插嘴采集器与看门狗**——修复「敲 y 被插嘴线程吃掉、审批卡死」的竞争（用户实测 91s 无响应）                                                                                                                                |
 | 🪟 **思考滚动窗**       | 思考/决策内容**固定高度滚动显示**（默认 6 行，带 `┌─ 💭 深度思考 ─┐` 边框）——1-6 行 → 2-7 行推进，历史随框滚出，既全流过又不霸屏（非 TTY 全显）                                                                                    |
 | 🌐 **系统级长期记忆** | 跨项目共享的 `longtermmemory.md`（默认 `<个人文档>/.axon/`）——系统环境、用户信息、偏好、工具链路径等**所有项目通用**的事实；启动时按「长期记忆 > 项目记忆」顺序载入；模型经 `global_memory_write` 工具适时更新，`memory.long_term_file` 可改位置 |
-| ⏱️ **会话时长** | 退出时显示本次会话用时（`── 本次会话时长：X 分 Y 秒`） |
+| ⏱️ **每回合用时** | 每次完成任务后在页脚显示本回合耗时（`── 已完成 · 轮次 N · token M · 用时 X 分 Y 秒`） |
 | 🧷 **跨回合去重**       | 流式文本五道防线（增量/累积/前缀重放/**整段重放 rfind 探测**/尾部重叠），修复 client 模式下的整页重放                                                                                                                                       |
 | 📏 **流式限行**         | 思考流 ≤4 行、正文流 ≤30 行（超出静默累积 + 折叠提示，`Ctrl+O` 详细模式全显），防「内心独白」霸屏                                                                                                                                             |
 | 💬 **插嘴即时生效**     | 执行中打字回车 → **独立一行**回显（不与输出拼接），并通过 prompt 流式通道**立即注入**——智能体在**下一个动作前**确认并重新规划，不再等整个回合结束；`agent.stream_interject` 可回退旧行为                                   |

@@ -698,7 +698,17 @@ def _stream_write(text: str) -> None:
     sys.stdout.flush()
 
 
-def _print_turn_result(console, r: TurnResult) -> None:
+def _fmt_duration(sec: float) -> str:
+    """秒 → 人类可读时长（v0.4.22）。"""
+    total = int(sec)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h} 小时 {m} 分 {s} 秒"
+    return f"{m} 分 {s} 秒" if m else f"{s} 秒"
+
+
+def _print_turn_result(console, r: TurnResult, elapsed: float | None = None) -> None:
     reason_cn = {
         "verified": "已完成（V 层验证通过）",
         "max_turns": f"达到轮次上限（{r.turns_used}）",
@@ -709,6 +719,8 @@ def _print_turn_result(console, r: TurnResult) -> None:
         "verification_failed": "V 层验证未通过",
     }.get(r.stop_reason, r.stop_reason)
     line = f"── {reason_cn} · 轮次 {r.turns_used} · token {r.tokens_used}"
+    if elapsed is not None:
+        line += f" · 用时 {_fmt_duration(elapsed)}"      # v0.4.22：本回合用时（用户要求）
     if console is not None:
         console.print(line, style="dim", markup=False)
         if r.note:
@@ -771,6 +783,7 @@ def _compose_user_input(app: dict, text: str) -> str:
 
 def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = None):
     """执行一个回合：流式输出 + 状态反馈 + 执行中插嘴采集（v0.2.6）。"""
+    t_turn = time.monotonic()                    # v0.4.22：本回合用时（用户要求）
     console = app["console"]
     loop = app["loop"]
     text = _compose_user_input(app, text)
@@ -815,7 +828,7 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
                 print(f"   ⌨ 插嘴（未提交）：{left}")
     sys.stdout.write("\n")
     sys.stdout.flush()
-    _print_turn_result(console, result)
+    _print_turn_result(console, result, elapsed=time.monotonic() - t_turn)
     return result
 
 
@@ -1801,20 +1814,7 @@ def main(argv: list[str] | None = None) -> int:
         status.idle()
         return 0
 
-    t_session = time.monotonic()                 # v0.4.21：会话时长（用户要求）
-    rc = repl(app, session, resume_note)
-    dur = time.monotonic() - t_session
-    h, rem = divmod(int(dur), 3600)
-    m, s = divmod(rem, 60)
-    dur_s = (f"{h} 小时 {m} 分 {s} 秒" if h else
-             (f"{m} 分 {s} 秒" if m else f"{s} 秒"))
-    out = app.get("console")
-    line = f"── 本次会话时长：{dur_s}"
-    if out is not None:
-        out.print(line, style="dim", markup=False)
-    else:
-        print(line)
-    return rc
+    return repl(app, session, resume_note)
 
 
 if __name__ == "__main__":
