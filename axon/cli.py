@@ -135,10 +135,14 @@ class StatusLine:
 
     # ---- 内部 ----
     def _input_line(self) -> str:
-        """常驻输入行（v0.2.9）：插嘴内容显示在这里，提示符始终占位。"""
+        """常驻输入行（v0.2.9）：插嘴内容显示在这里，提示符始终占位。
+
+        v0.4.23：有输入时**明确提示"按回车发送"**——用户实测"插不进嘴"
+        正是因为打出内容后不知道该按回车（显示停留在缓冲态）。
+        """
         cur = self.keyboard.current_input() if self.keyboard is not None else ""
         if cur:
-            return f"axon ➤ 插嘴: {cur[-160:]}"
+            return f"axon ❯ 插嘴: {cur[-160:]}  ← 按回车发送"
         return "axon ❯ （执行中可直接输入补充，回车提交）"
 
     def _write(self, text: str) -> None:
@@ -373,9 +377,13 @@ class StatusLine:
         while len(lines) < self.SCROLL_N:
             lines.insert(0, "")
         lines = lines[-self.SCROLL_N:]
-        return Panel(Text("\n".join(lines), style="dim"), title="💭 深度思考",
-                     title_align="left", border_style="dim",
-                     height=self.SCROLL_N + 2, padding=(0, 1))
+        body = Text("\n".join(lines), style="dim")
+        # v0.4.23：Live 期间的插嘴回显直接显示在面板底部（即时反馈，不被吞）
+        pending = getattr(self, "_pending_echo", None)
+        if pending:
+            body.append("\n" + pending[-1][0], style=pending[-1][1])
+        return Panel(body, title="💭 深度思考", title_align="left",
+                     border_style="dim", height=self.SCROLL_N + 2, padding=(0, 1))
 
     def _thinking_begin(self) -> None:
         """打开思考滚动框（rich Live，原地刷新，跨平台可靠）。"""
@@ -425,6 +433,12 @@ class StatusLine:
             self._live = None
             self._live_active = False                    # v0.4.20：释放终端
             self._thinking_open = False
+            # v0.4.23：补打 Live 期间排队的回显（插嘴提交确认等，防被吞）
+            pending = getattr(self, "_pending_echo", None)
+            if pending:
+                self._pending_echo = []
+                for msg, style in pending:
+                    self._print(msg, style=style)
             self._scroll_area = 0
             self._scroll_lines = []
             self._scroll_buf = ""
@@ -1787,16 +1801,35 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
         return 2
     def _on_submit(text: str) -> None:
-        # v0.4.15：独立一行回显（原来直接 print 会与流式输出拼在一行）；
-        # 插嘴即时入队发送，不再等回合结束确认
+        # v0.4.15：独立一行回显；v0.4.23：**Live 期间排队防吞** + **送达失败可见**
         status = app["loop"].status
+        msg = f"💬 [插嘴] 已提交（将在下一个动作前生效）：{text}"
         status.ensure_newline()
-        msg = f"💬 [插嘴] {text}"
+        warn = None
+        bridge = app.get("interject_bridge")
+        if bridge is None or not bridge.submit(text):
+            warn = "⚠ 插嘴未能送达（任务可能刚结束）——请把它作为下一条消息发送"
+        queued = getattr(status, "_pending_echo", None)
+        if getattr(status, "_live_active", False):
+            # 思考滚动框（rich Live）独占终端：直接 print 会被吞/破坏布局
+            # → 排队 + 立即刷新面板（面板底部显示回显，v0.4.23）；
+            # _close_thinking 时补打完整回显
+            status._pending_echo = (queued or []) + [(msg, "green")]
+            if warn:
+                status._pending_echo.append((warn, "yellow"))
+            try:
+                status._scroll_redraw(force=True)
+            except Exception:       # noqa: BLE001
+                pass
+            return
         if console is not None:
             console.print(msg, style="green", markup=False)
+            if warn:
+                console.print(warn, style="yellow", markup=False)
         else:  # pragma: no cover
             print(msg)
-        app["interject_bridge"].submit(text)
+            if warn:
+                print(warn)
 
     reader = InterjectReader(on_submit=_on_submit)
     app["keyboard"] = reader
