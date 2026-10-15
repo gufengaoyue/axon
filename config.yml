@@ -1,0 +1,125 @@
+# ============ AXON 配置（声明式单一事实源；CLI 参数可覆盖） ============
+version: 1
+
+# workspace 不配置则默认为 <project>/.workspace（每个项目独立工作空间，智能体在全权限区）；
+# 需要自定义时取消下面注释：
+# workspace: ./workspace
+# 项目目录（区分不同项目 + 绑定会话）。留空/`.` = **当前目录**；
+# 若当前目录是主程序目录（禁止写入），则自动在 <用户目录>/axon/ 下新建
+# 以时间戳命名（YYYY-MM-dd_HH-MM-SS）的项目目录。
+project:
+
+model:
+  active_provider: codebuddy
+  # env_api_key / env_environment 填**环境变量名**（推荐：set CODEBUDDY_API_KEY=... 后写 CODEBUDDY_API_KEY）；
+  # 也兼容直接把 key 值填在这里
+  # 图片理解（v0.4.6）：auto = 按模型名判定视觉能力（命中白名单才原生注入）；
+  #   on = 总是原生注入图片；off = 总是走视觉副模型描述兜底
+  vision: auto
+  # 主模型无视觉时的"描述模型"（OpenAI 兼容；base_url 留空则退化为元数据提示）
+  vision_helper:
+    base_url: ""                 # 例：https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    model: gpt-4o-mini
+    # codebuddy | openai（用户自选）
+  context_window: 128000        # 模型上下文窗口（token），压缩阈值按此计算
+  max_output_tokens: 8192
+  session_token_budget: 400000  # 单会话 token 总预算（E 层第二道保险）
+  providers:
+    codebuddy:
+      # 凭证只走环境变量，禁止写进本文件（L 层 SecretScan 会拦）
+      env_api_key: CODEBUDDY_API_KEY
+      env_environment: CODEBUDDY_INTERNET_ENVIRONMENT
+      default_model: hy3        # 需求文档指定：开发期用 hy3 测试
+      timeout_sec: 180
+      cli_port: 0               # CLI 控制服务器端口；0=自动挑选空闲端口
+                               # （CLI 默认 57521，易与本机 CodeBuddy IDE 服务冲突）
+    openai:
+      env_api_key: OPENAI_API_KEY
+      base_url: https://api.openai.com/v1   # 任意 OpenAI 兼容端点
+      default_model: gpt-4o-mini            # 示例值，用户自选
+      timeout_sec: 180
+
+context:
+  compact_warn_ratio: 0.8       # 80% 水位：清理最旧工具输出（留占位）
+  compact_force_ratio: 0.9      # 90% 水位：结构化强制压缩（需求文档指定）
+  tool_result_max_tokens: 1500  # 单条工具结果入窗截断
+  memory_max_tokens: 4000       # AXON.md 注入稳定前缀的上限
+
+agent:
+  show_thinking: true           # 显示模型思考/决策过程（v0.4.11；💭 前缀、弱化样式）
+  # max_turns: 50               # 单回合最大轮次（也可 --max-turns）
+  # stuck_threshold: 3          # 打转检测阈值
+
+sandbox:
+  backup:
+    enabled: true
+    dir: ./snapshots            # 相对程序级目录 ~/文档/.axon；修改前快照（v0.2.0 程序级）
+  trash:
+    dir: ./trash                # 相对程序级目录；send2trash 失败时的降级回收目录
+  trash:
+    dir: .axon/trash          # send2trash 失败时的降级回收目录
+  batch_delete_threshold: 50   # 单次删除路径数超过 → 强制审批（无论在工作空间内外）
+  approval_granularity: prefix  # 授权缓存键粒度：prefix=命令首token+参数骨架 | exact=完整指纹
+  read_auto_allow: true         # 读操作无规则命中时默认放行（v0.1.4 用户审定：读取免询问）
+                                # 写/改/删/越界仍询问；deny 表对读写都硬拦；显式 paths 规则优先
+  paths:                       # 路径三态；最长前缀匹配，同长 deny>ask>allow
+    - { path: "<workspace>", mode: allow }
+    - { path: "<system>", mode: deny }     # 展开为 C:\Windows / /usr 等
+    - { path: "<home>/.ssh", mode: deny }
+    - { path: "<home>", mode: deny }       # 用户根默认拒；需要就单独开子路径，如：
+    # - { path: "<home>/Documents", mode: ask }
+  commands:                    # glob 前缀三态；deny 优先；未命中默认 ask（fail-closed）
+    allow: ["ls","cat","pwd","echo","find","grep","rg","git status","git diff","git log","git add","git commit"]
+    ask:   ["rm","mv","cp","pip install","npm install","curl","wget","docker","ssh","scp","chmod","chown","kill","python","node"]
+    deny:  ["rm -rf /","rm -rf /*","mkfs","format","dd if=","shutdown","reboot",":(){"," > /dev/sd"]
+  command_bypass_whitelist: [] # 手动开启后这些前缀跳过命令规则（仍过路径/网络/审计）
+  network:
+    local_allow: true          # localhost / 127.0.0.1 / ::1 / 私网段 默认放行
+    remote_default: allow      # 远程请求默认放行（v0.2.1 用户审定：web_fetch 直接访问网络）
+                               # allow | ask | deny；域名黑名单与 secret scan 仍然生效
+    domain_allow: []           # 白名单（命中 → 自动放行档）
+    domain_deny: []            # 黑名单（命中 → 直接阻断，优先于白名单）
+    secret_scan: true          # 出网前敏感信息扫描（命中即拒）
+  risk_grading:                # 动作 → 人在回路档位映射（四档）；键 = Action.kind 统一口径
+    green_auto:   ["fs_read"]
+    yellow_notify: ["fs_write","fs_edit"]
+    red_confirm:  ["fs_delete","shell","network","mcp"]
+    black_block:  []           # 直接阻断清单（域名黑名单由 network.domain_deny 承担）
+    # 档位升级：跨目录访问 → PathPolicy 将 fs_* 升一档；批量删除超阈值 → fs_delete 升红；
+    #         本地/远程网络 → NetworkPolicy 分档（local_allow 绿 / remote 红）；memory_write 按 fs_write 黄档
+
+memory:
+  file: AXON.md              # 项目记忆（相对 project）：双区——长期记忆（模型写）+ 进度日志（每回合自动记）
+  max_entries: 200
+  auto_journal: true           # 每回合结束自动追加进度日志（规则式，零 token）
+  auto_summary_on_exit: true   # 会话结束沉淀项目记忆（模型总结：需求/进度/决策/踩坑/偏好环境/下一步）
+  summary_min_messages: 4      # 会话消息数低于此值不触发总结
+  recover_prompt: true         # 启动时检测"异常结束"的会话（直接关窗口）并提示补沉淀（v0.2.9）
+
+tools:
+  downloads_dir: downloads     # web_fetch 下载落盘目录（相对 workspace）
+  max_download_mb: 100         # 单文件下载上限
+  # doc_extensions: []         # 常规类型（直接下载不问）：留空用内置表（pdf/pptx/xlsx/docx/txt/csv/图片/音视频…）
+  # risk_extensions: []        # 风险类型（下载前询问）：留空用内置表（zip/rar/7z/bat/cmd/exe/msi/ps1/vbs/js/dll…）
+  move_products_to_project: true # 回合结束把工作空间产物移到项目目录（v0.3.0；downloads/tmp 除外）
+  auto_create_venv: true         # 程序级共享 venv 不存在则自动创建（v0.4.4；位于程序数据目录下）
+  clipboard_watch: false         # 后台监听剪贴板收编图片（v0.4.8 默认关：截图≠粘贴，
+                                 #   改用 Ctrl+V 粘贴键或 /attach 主动触发）
+  clipboard_auto_attach: false   # 每次输入后自动读剪贴板（默认关；用 /attach 显式触发）
+  cleanup_temp_each_turn: true # 回合结束清理临时文件（v0.2.2）：程序临时目录 + *.tmp/*.bak/~$* 等明确模式
+                               # 产物（downloads/ 与用户文件）不清理；日志类 *.log 也不清
+  # temp_patterns: ["*.tmp", "*.bak", "~$*"]   # 自定义临时文件模式（一般不用改）
+
+session:
+  db: ./sessions.db            # 相对路径基于程序级目录 ~/文档/.axon（v0.2.0：全局共享，跨项目 resume）
+  audit_retention_days: 90
+
+mcp:
+  servers: []                  # MCP 连接器（整体/单独开关）；示例：
+  # - name: filesystem
+  #   transport: stdio         # stdio | http
+  #   command: npx
+  #   args: ["-y","@modelcontextprotocol/server-filesystem","<workspace>"]
+  #   enabled: true            # false = 整体关闭
+  #   tools: {}                # {tool_name: true|false} 单独禁用某工具
