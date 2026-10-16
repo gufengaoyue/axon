@@ -70,6 +70,9 @@ context:
 
 agent:
   show_thinking: true           # 显示模型思考/决策过程（v0.4.11；💭 前缀、弱化样式）
+  # two_line_status: false      # 双行状态行（状态行+常驻输入行）默认关（v0.4.28）：
+  #                              #   裸 ANSI 重绘易与流式输出/思考框/审批面板错位残留；
+  #                              #   底部工具栏已常驻等价提示。true=开回（bug 已修）
   # max_turns: 50               # 单回合最大轮次（也可 --max-turns）
   # stuck_threshold: 3          # 打转检测阈值
   # auto_note: trigger          # 本回合教训沉淀策略（v0.4.24）：

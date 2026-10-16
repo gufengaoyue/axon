@@ -39,6 +39,8 @@ HELP_TEXT = """\
 可用命令：
   /help                 显示本帮助
   /save [补充说明]      沉淀项目记忆（调用模型总结本次会话，写入 AXON.md）
+  /think [n|all]        回顾思考全文（v0.4.28）：默认最近 1 段，n=最近 n 段，
+                        all=全部；长内容折叠（Ctrl+O / /verbose on 全显）
   /delproj [项目]       删除项目（与命令行 `python -m axon --delproj [项目]` 等价）
                         不带参数列出项目；需输入项目名确认（默认只删会话数据）
   /attach [路径]        附加图片/文件（不带参数读剪贴板）；截图/复制文件会被**自动收编**
@@ -124,6 +126,12 @@ class StatusLine:
         self._note_idx = 0
         self.keyboard = None           # InterjectReader（v0.2.6：执行中插嘴回显）
         self.image_model = ""          # 生图模型名（v0.4.25：调用时特别提醒用）
+        # v0.4.28：双行状态行默认关（见 _start 注释）；会话 id 供思考存档用
+        self.two_line_status = False
+        self.session_id = ""
+        self._two_line_primed = False  # 双行占位是否已建立（防重复写 "\n"）
+        self._think_round = 0          # 思考存档段计数
+        self._think_note_shown = False # 本回合是否已提示过"可 /think 回顾"
         self._last_event = 0.0         # 最近一次事件时间（看门狗用，v0.4.5）
         self._thinking_open = False    # 思考行是否打开（增量流式，v0.4.12）
         self._live_active = False      # rich Live 是否独占终端（v0.4.20）
@@ -178,7 +186,9 @@ class StatusLine:
         if self.keyboard is not None:
             cur = self.keyboard.current_input()
             if cur:
-                tail = f"   ⌨ 插嘴: {cur[-48:]}"
+                # v0.4.28：单行模式沿用双行的"← 按回车发送"提示（v0.4.23
+                # 修复"插不进嘴"的核心提示，不因默认关双行而丢失）
+                tail = f"   ⌨ 插嘴: {cur[-48:]}  ← 按回车发送"
         self._write(f"{status}{tail}")
         return f"{status}{tail}"
 
@@ -211,12 +221,19 @@ class StatusLine:
         self._t0 = time.monotonic()
         self._running = True
         self._line_len = 0
-        # 双行模式：先占一行给状态行（输入行由首帧写出），使提示符"一直存在"
-        self._two_line = bool(_VT_OK)
-        if self._two_line:
+        # 双行模式（v0.2.9："提示符一直存在"）——v0.4.28 起**默认关闭**：
+        # "\n" 占位 + `\x1b[1A` 上移重绘与流式输出/思考框/审批面板互相干扰，
+        # 且 spinner 重启（text() 停 → tool() 再起）会**重复写 "\n" 占位** →
+        # 光标行偏移 → 之后每帧清错行 → 旧帧永久残留（用户实测截图：
+        # 两行重复的"正在执行 execute_shell, 请稍等... (0s)"停住不消失，
+        # 执行早已完成）。底部工具栏（v0.4.8 起）常驻等价提示，双行收益
+        # 已被覆盖；agent.two_line_status: true 可开回（占位已修 primed）。
+        self._two_line = bool(_VT_OK) and self.two_line_status
+        if self._two_line and not self._two_line_primed:
             try:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
+                self._two_line_primed = True
             except (ValueError, OSError):
                 self._two_line = False
         self._thread = threading.Thread(target=self._spin, daemon=True)
@@ -230,6 +247,9 @@ class StatusLine:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+        # join 后 _spin 的收尾清理已跑完（屏幕无双行结构）→ 占位标记复位，
+        # 下次 _start() 重新建立（v0.4.28：修 spinner 重启重复占位导致的错位）
+        self._two_line_primed = False
 
     # ---- 状态协议（AgentLoop / CodebuddyRunner 调用） ----
     def thinking(self, note: str = "") -> None:
@@ -349,6 +369,9 @@ class StatusLine:
         self._stop()
         if not text:
             return
+        # v0.4.28：始终累积全文（滚动窗只看尾部——用户要求"保留现显示方式的
+        # 同时能回顾全部思考"；_close_thinking 时落盘供 /think 回顾）
+        self._thinking_full = getattr(self, "_thinking_full", "") + str(text)
         if not self._tty or self.console is None:
             # 无 rich 控制台（非 TTY / 纯 stdout）：直接全显（无法原地重绘）
             if not self._thinking_open:
@@ -451,7 +474,40 @@ class StatusLine:
         self._think_shown = 0            # 兼容旧计数（v0.4.16）
         self._think_hidden = 0
         self._think_capped_noted = False
+        self._archive_thinking()         # v0.4.28：全文落盘（/think 可回顾）
         self._thinking_full = ""
+
+    def _archive_thinking(self) -> None:
+        """思考全文落盘（v0.4.28，用户要求"保留滚动显示方式又能回顾全部"）。
+
+        落 `<program_root>/thinking/<会话8位>.log`，每段带序号/时间/字数；
+        `/think [n|all]` 回顾。单文件超 2MB 保留后半再续写（防无限增长）。
+        非 TTY（管道/重定向）不落盘——那种场景思考本就全显。
+        """
+        full = getattr(self, "_thinking_full", "") or ""
+        if not full.strip() or not self._tty:
+            return
+        try:
+            from datetime import datetime
+            from axon.config import program_root
+            d = program_root() / "thinking"
+            d.mkdir(parents=True, exist_ok=True)
+            sid = (self.session_id or "session")[:8]
+            p = d / f"{sid}.log"
+            if p.exists() and p.stat().st_size > 2 * 1024 * 1024:
+                p.write_text(p.read_text(encoding="utf-8")[-1024 * 1024:],
+                             encoding="utf-8")       # 超限 → 保留后半
+            self._think_round = getattr(self, "_think_round", 0) + 1
+            stamp = datetime.now().strftime("%m-%d %H:%M:%S")
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(f"\n===== 思考 #{self._think_round} · {stamp} · "
+                        f"{len(full)} 字 =====\n{full}\n")
+            if not self._think_note_shown:
+                self._think_note_shown = True          # 每回合只提示一次（降噪）
+                self._print(f"💭 思考全文 {len(full)} 字已存档 → /think 可回顾",
+                            style="dim")
+        except Exception:
+            pass                                    # 存档失败不影响主流程
 
     def thinking_line(self, text: str) -> None:
         """模型思考/决策过程（整块模式，v0.4.11）：dim + 💭 前缀，多行逐行加前缀。
@@ -828,6 +884,7 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
     st._text_hidden = 0
     st._text_capped_noted = False
     st._text_full = ""
+    st._think_note_shown = False        # v0.4.28：思考存档提示每回合一次
     if kb is not None and kb.enabled and kb._thread is None:
         kb.start()
     app["loop"].status.start_watchdog()      # v0.4.5：静默期自动转圈
@@ -1122,6 +1179,47 @@ def _mark_ended(app: dict, session) -> None:
         pass
 
 
+def _think_log_path(session) -> Path:
+    """思考存档文件（v0.4.28）：<程序数据目录>/thinking/<会话8位>.log。"""
+    from axon.config import program_root
+    sid = (getattr(session, "id", "") or "session")[:8]
+    return program_root() / "thinking" / f"{sid}.log"
+
+
+def _cmd_think(app: dict, session, arg: str, out) -> None:
+    """/think [n|all]：回顾本会话思考全文（v0.4.28，用户要求"收起/展开"——
+    默认仍是滚动窗（收起态），想回顾时用本命令读存档（展开态），
+    不改变执行中的显示方式）。"""
+    p = _think_log_path(session)
+    if not p.is_file():
+        out("本会话还没有思考存档（思考过程发生在有 TTY 的会话中）", style="dim")
+        return
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        out(f"读取思考存档失败: {e}", style="yellow")
+        return
+    # 段格式："\n===== 思考 #n · stamp · N 字 =====\n<全文>\n"
+    rounds = [seg for seg in text.split("\n===== ") if seg.strip()]
+    if not rounds:
+        out("思考存档为空", style="dim")
+        return
+    arg = (arg or "").strip().lower()
+    if arg == "all":
+        shown = rounds
+    else:
+        n = 1
+        if arg.isdigit():
+            n = max(1, min(int(arg), len(rounds)))
+        shown = rounds[-n:]
+    body = "\n===== ".join(shown).splitlines()
+    folded = app["loop"].status.block(body)
+    out(f"💭 思考存档 · 共 {len(rounds)} 段，显示 {len(shown)} 段"
+        f"（{len(body)} 行，路径 {p}）：", style="dim")
+    for ln in folded:
+        out(ln, style="dim")
+
+
 def _replay_history(app: dict, session, limit: int = 14) -> None:
     """resume 后把最近的历史对话展示出来（v0.2.5，用户反馈"只看到智能体输出"）。
 
@@ -1346,6 +1444,7 @@ def _ask_continue() -> bool:
 SLASH_COMMANDS = [
     ("/help", "显示帮助"),
     ("/save", "立即沉淀项目记忆"),
+    ("/think", "回顾思考全文（n=最近n段 / all=全部）"),
     ("/attach", "附加图片/文件（读剪贴板或路径）"),
     ("/sessions", "列出最近会话（跨项目）"),
     ("/resume", "恢复会话"),
@@ -1651,9 +1750,9 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
         if pending_attach:
             line += attachments.build_attachment_note(pending_attach)
             pending_attach = []
-        # v0.4.27：记录回合前的消息数——L1 信号判定只用**本回合增量**消息
-        # （旧实现传全量历史 → corrected 信号从第二回合起恒真、lesson 可能
-        # 来自历史配对，沉淀几乎每回合都触发）
+        # v0.4.28：会话 id 挂到状态行（思考存档按会话分文件；/resume 换会话后
+        # 这里刷新，保证存档落到当前会话）
+        status.session_id = getattr(session_ref[0], "id", "") or ""
         try:
             n_msgs_before = len(store.load_messages(session_ref[0].id))
         except Exception:                     # noqa: BLE001
@@ -1779,6 +1878,8 @@ def handle_slash(app: dict, session, line: str, state: dict, ps) -> object | Non
         r = _run_turn(app, session, prompt, _ask_continue)
         if r.products or r.stop_reason == "verified":
             out("已沉淀项目记忆 → " + str(app["cfg"].memory_path), style="dim")
+    elif cmd == "/think":
+        _cmd_think(app, session, line[len(cmd):].strip(), out)
     elif cmd == "/compact":
         if hasattr(app["loop"].provider, "run_turn"):
             out("codebuddy 路：上下文由 SDK 自管（自动压缩），/compact 不适用")
@@ -1866,6 +1967,8 @@ def main(argv: list[str] | None = None) -> int:
     _ig = getattr(cfg, "image_gen", None)
     if _ig is not None and getattr(_ig, "configured", False):
         status.image_model = str(_ig.model)
+    # v0.4.28：双行状态行默认关（见 StatusLine._start 注释；可配置开回）
+    status.two_line_status = bool(getattr(cfg.agent, "two_line_status", False))
 
     # --repair-db：最优先处理——库坏了也要能修（v0.4.3）
     if args.repair_db:

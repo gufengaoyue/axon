@@ -385,6 +385,11 @@ class AgentLoopConfig:
     parallel_limit: int = 8
     stuck_threshold: int = 3
     show_thinking: bool = True              # 显示模型思考/决策过程（v0.4.11）
+    # v0.4.28：双行状态行（状态行 + 常驻输入行）默认**关闭**——裸 ANSI 占位/
+    # 上移重绘与流式输出、思考框、审批面板互相干扰，实测多次错位残留
+    # （"正在执行…"残行停住不消失）；底部工具栏已常驻等价提示。
+    # true = 开回双行（占位重复 bug 已修）
+    two_line_status: bool = False
     stream_interject: bool = True           # 插嘴执行中即时注入（v0.4.15；关则回退回合后确认）
     # 记忆沉淀策略（v0.4.24，三层方案 L0/L1/L2）：
     #   trigger = 有信号（失败恢复/打转中断/插嘴纠正/自检⚠）才调模型沉淀本回合教训（默认）
@@ -784,6 +789,7 @@ def load_config(path: str | Path | None = None,
         parallel_limit=int(a.get("parallel_limit", cfg.agent.parallel_limit)),
         stuck_threshold=int(a.get("stuck_threshold", cfg.agent.stuck_threshold)),
         show_thinking=bool(a.get("show_thinking", cfg.agent.show_thinking)),
+        two_line_status=bool(a.get("two_line_status", cfg.agent.two_line_status)),
         stream_interject=bool(a.get('stream_interject', cfg.agent.stream_interject)),
         auto_note=str(a.get('auto_note', cfg.agent.auto_note) or 'trigger'),
     )
