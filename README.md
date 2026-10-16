@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/gufengaoyue/axon"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-gufengaoyue%2Faxon-181717?logo=github"></a>
   <a href="https://pypi.org/project/ai-agent-axon/"><img alt="PyPI" src="https://img.shields.io/badge/PyPI-ai--agent--axon-3775A9?logo=pypi&logoColor=white"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.4.26-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.27-blue">
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -65,6 +65,8 @@ Axon 是一个**在你的电脑上本地运行**的 AI 智能体。它不是一�
 | 🎨 **生图模型入口** | 文生图/图生图**独立接入口**（`image_gen` 配置段，OpenAI 兼容 images API：generations=文生图 / edits=图生图）——**只有显式生图任务才调用**，调用时终端 🖼 特别提醒；未配置或失败 → 放弃任务并告知用户，**禁止**用无生图能力的模型冒充生成图片 |
 | 🧯 **中断即恢复** | `Ctrl+C` 中断后**立即停止转圈/思考框**（修复 rich Live 刷新线程在中断后持续重绘终端导致的"一直转圈"）；看门狗线程停止时 join，杜绝"停止后又转起来"的竞态 |
 | 🔌 **端点灵活切换** | `--base-url` 临时覆盖端点；`base_url` 支持**环境变量名间接**（写 `OPENAI_BASE_URL` 自动展开，未设置启动时报可操作错误）；模型调用失败（连接/401/404/429/400）给出**分型排查话术**——端点与模型名错配（如 qwen 打到 api.openai.com）、代理环境变量陷阱都会明确指出，不再裸 traceback |
+| 🛑 **验证防死循环** | 修复“答对了却反复自证重写”：打转后用户选继续即**解除粘滞**（换方法成功可正常结题）；V 层验证连续 2 次未通过即**熔断**（不再无限追加 `<verification_failed>` 观察消息）；验证规则按**回合 scope** 扫描（历史遗留失败不污染新回合）；被拒后换方法成功不判负 |
+| ⏹️ **中断即停** | Ctrl+C 中断的回合**不触发沉淀**（旧实现在中断后又开一个沉淀回合、继承毒上下文再次陷循环——用户实测“停了还在想”）；沉淀提示词显式隔离历史观察消息；L1 信号源改本回合增量消息（corrected 不再恒真） |
 
 ---
 

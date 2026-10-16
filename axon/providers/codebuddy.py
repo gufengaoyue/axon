@@ -427,7 +427,8 @@ class CodebuddyRunner:
                                 int(ev.usage.get("completion_tokens", 0))
                     # UserMessage 携带工具结果 → 镜像落库
                     if t == "UserMessage":
-                        self._mirror_tool_results(session, msg, status=status)
+                        self._mirror_tool_results(session, msg, status=status,
+                                                  scope_turns=scope_turns)
                     if t == "ResultMessage":
                         sdk_session_id = getattr(msg, "session_id", None) or sdk_session_id
                         if getattr(msg, "is_error", False) and not pending_ij:
@@ -659,7 +660,8 @@ class CodebuddyRunner:
             self.store.append_message(session.id, Message(role="assistant",
                                                           content=prose))
 
-    def _mirror_tool_results(self, session, user_msg, status=None) -> None:
+    def _mirror_tool_results(self, session, user_msg, status=None,
+                             scope_turns: set[int] | None = None) -> None:
         from axon.agent.loop import NullStatus
         status = status or NullStatus()
         for b in (getattr(user_msg, "content", None) or []):
@@ -672,10 +674,12 @@ class CodebuddyRunner:
                 text = "\n".join(getattr(c, "text", str(c)) for c in text)
             is_err = bool(getattr(b, "is_error", False))
             status.tool_result(name, not is_err)
-            self.store.append_message(session.id, Message(
+            m = self.store.append_message(session.id, Message(
                 role="tool", tool_call_id=tid, name=name,
                 content=pack_tool_content(str(text), {},
                                           error_type="model" if is_err else None)))
+            if scope_turns is not None:
+                scope_turns.add(m.turn)    # v0.4.27：tool 消息纳入回合 scope
 
     # ---- 端口 ----
     def _pick_port(self) -> int:

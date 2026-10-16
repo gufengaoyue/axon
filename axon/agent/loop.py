@@ -317,6 +317,10 @@ class AgentLoop:
         turns = 0
         stuck = StuckDetector(self.config.agent.stuck_threshold)
         stuck_fired = False
+        vf_count = 0                       # v0.4.27：连续 verification_failed 熔断计数
+        # v0.4.27：本回合起始 turn——V 层验证按回合 scope 扫描，历史遗留失败
+        # （往回合的 transient/resource 错误）不再污染新回合（旧实现扫全量 → 死循环）
+        turn_start = self.store.next_turn(session.id) - 1
 
         try:
             while turns < self.config.agent.max_turns:
@@ -393,15 +397,32 @@ class AgentLoop:
 
                 # ---- 无工具调用 → V 层验证 ----
                 if not tool_calls:
-                    vr = self.verifier.verify(session, text, stuck_fired=stuck_fired)
+                    vr = self.verifier.verify(
+                        session, text, stuck_fired=stuck_fired,
+                        scope_turns={m.turn for m in
+                                     self.store.load_messages(session.id)
+                                     if m.turn >= turn_start})
                     if vr.passed:
                         return TurnResult(text, "verified", turns, tokens_used,
                                           self._side_effects(session))
+                    vf_count += 1
+                    if vf_count >= 2:
+                        # v0.4.27：连续 2 次验证失败 → 熔断。旧实现无限追加
+                        # <verification_failed> 观察消息 → 模型反复自证重写
+                        # （用户实测"总结时陷入自证死循环"，跑满 max_turns 才停）
+                        return TurnResult(text, "verification_failed", turns,
+                                          tokens_used, self._side_effects(session),
+                                          note=(f"V 层验证连续 {vf_count} 次未通过"
+                                                f"（{', '.join(vr.failed_rules)}），已停止"
+                                                f"自动重试。{vr.advice}"))
                     self.store.append_message(session.id, Message(
                         role="user",
                         content=f"<verification_failed>\n未通过规则: "
                                 f"{', '.join(vr.failed_rules)}\n{vr.advice}\n"
-                                "请修正后继续。\n</verification_failed>"))
+                                "（说明：这是**系统自动规则校验**，不是用户报错。若你判断"
+                                "任务实际已完成、上述规则为误报，请在终答中说明理由即可"
+                                "结题——不要反复重写已经正确的答案。）\n"
+                                "</verification_failed>"))
                     continue
 
                 # ---- 工具执行（全部过沙箱网关） ----
@@ -434,6 +455,11 @@ class AgentLoop:
                         return TurnResult(text or "", "stuck_break", turns, tokens_used,
                                           self._side_effects(session))
                     stuck = StuckDetector(self.config.agent.stuck_threshold)
+                    # v0.4.27：用户选择"继续尝试" = 重新来过——**必须解除粘滞**。
+                    # 旧实现保留 stuck_fired=True，导致本回合后续所有终答都被规则 5
+                    # 判负 → 无限追加 <verification_failed> → 模型自证死循环
+                    # （用户实测：换方法成功后仍无法结题，只能重启会话）
+                    stuck_fired = False
 
                 # ---- 预算闸 ----
                 if tokens_used > self.config.model.session_token_budget:

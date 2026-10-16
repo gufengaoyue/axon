@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-agent-axon"
-version = "0.4.26"
+version = "0.4.27"
 description = "Axon — 单用户 CLI Agent Harness：沙箱工具网关、双模型接入、可续跑与项目记忆"
 readme = "README.md"
 requires-python = ">=3.10"

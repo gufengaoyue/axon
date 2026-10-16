@@ -111,18 +111,21 @@ class TurnVerifier:
     def verify(self, session, final_text: str, stuck_fired: bool = False,
                scope_turns: set[int] | None = None,
                check_effects: bool = True) -> VerifyResult:
-        """scope_turns: 显式回合集合（codebuddy runner 路径用）；
-        缺省用"最后一条 assistant 消息所在回合"（openai loop 路径）。
-        check_effects=False 时跳过规则 3/4（runner 路径无回读/退出码 meta）。
+        """scope_turns: **本回合全部消息的 turn 集合**（v0.4.27 起规则 1/3/4 按它
+        过滤——历史遗留失败不再污染新回合；None = 全量扫描的旧行为）。
+        codebuddy runner 路径由 _mirror_* 逐条纳入；openai loop 路径按
+        turn_start 过滤。check_effects=False 时跳过规则 3/4（runner 路径
+        无回读/退出码 meta）。
         """
         failed: list[str] = []
         advice_parts: list[str] = []
         messages = self.store.load_messages(session.id)
         audit_rows = self.audit.rows(session.id)
 
-        # 规则 1：无未解决错误
+        # 规则 1：无未解决错误（v0.4.27：按回合 scope 扫描——旧实现扫全量历史，
+        # 往回合遗留的 transient/resource 失败会永久污染后续所有回合的验证）
         for m in messages:
-            if m.role == "tool" and m.content:
+            if m.role == "tool" and m.content and self._in_scope(m, scope_turns):
                 et = self._error_type_of(m)
                 if et in ("transient", "resource"):
                     failed.append("no_unresolved_errors")
@@ -130,13 +133,15 @@ class TurnVerifier:
                         f"工具 {m.name} 仍有未解决的 {et} 类错误，请重试或换路径后继续")
                     break
 
-        # 规则 2：红档动作审批核对（按回合口径）
+        # 规则 2：红档动作审批核对（v0.4.27：只看**最后一个轮次**的拒绝记录）
         if scope_turns is None:
             last_asst_turn = max((m.turn for m in messages if m.role == "assistant"),
                                  default=0)
             scope = {last_asst_turn}
         else:
-            scope = scope_turns
+            # 本回合早期被拒、模型随后换方法成功的场景**不该判负**（旧 openai 路
+            # 口径=最后 assistant 轮次；否则"拒绝→恢复→验证失败"又成死循环源）
+            scope = {max(scope_turns)}
         for r in audit_rows:
             if r["verdict"] in ("ask_denied", "deny"):
                 import json as _json
@@ -151,10 +156,10 @@ class TurnVerifier:
                         "请换用合规方式或征求用户同意")
                     break
 
-        # 规则 3：写文件回读校验
+        # 规则 3：写文件回读校验（v0.4.27：同样按回合 scope）
         if check_effects:
             for m in messages:
-                if m.role != "tool" or not m.content:
+                if m.role != "tool" or not m.content or not self._in_scope(m, scope_turns):
                     continue
                 meta = self._meta_of(m)
                 if meta and "sha256" in meta and "path" in meta:
@@ -174,7 +179,7 @@ class TurnVerifier:
         # 规则 4：shell 退出码
         if check_effects:
             for m in messages:
-                if m.role == "tool":
+                if m.role == "tool" and self._in_scope(m, scope_turns):
                     meta = self._meta_of(m)
                     if meta and meta.get("exit_code", 0) not in (0, None):
                         failed.append("shell_exitcodes_ok")
@@ -196,6 +201,18 @@ class TurnVerifier:
                             advice="；".join(advice_parts))
 
     # ---- meta/error_type 解析（存于 tool 消息 content 的 <meta> 标记，见 msgmeta.py） ----
+    @staticmethod
+    def _in_scope(m, scope_turns: set[int] | None) -> bool:
+        """消息是否属于本回合（v0.4.27）。
+
+        scope_turns=None → 不过滤（旧行为，全量扫描）；传入集合时只认集合内的
+        turn。tool 消息的 turn 与发起它的 assistant 消息不同（append_message
+        每包自增），因此调用方传入的必须是**本回合全部消息的 turn 集合**
+        （openai loop 路按 turn_start 过滤；codebuddy runner 路由
+        _mirror_tool_use/_mirror_tool_results 逐条纳入）。
+        """
+        return scope_turns is None or getattr(m, "turn", None) in scope_turns
+
     @staticmethod
     def _meta_of(m):
         from axon.agent.msgmeta import unpack_meta

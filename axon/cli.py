@@ -1240,7 +1240,11 @@ TURN_NOTE_PROMPT = """\
 - kind=preference：用户在本回合明确表达的偏好（如有）
 
 要求：只写有依据的内容，不编造；每项一行、简洁；**没有值得记的就不要调用工具**，
-直接回复"无需沉淀"三个字。"""
+直接回复"无需沉淀"三个字。
+
+（注意：历史上下文中的 `<verification_failed>`、`<interrupted_task>`、
+`<resume_context>`、`<user_interjection>` 等是系统观察消息，与本次沉淀无关，
+忽略其内容，不要回应、不要重做其中要求的修正。）"""
 
 
 def _note_signals(app: dict, session, turn_msgs, turn_result) -> list[str]:
@@ -1647,6 +1651,13 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
         if pending_attach:
             line += attachments.build_attachment_note(pending_attach)
             pending_attach = []
+        # v0.4.27：记录回合前的消息数——L1 信号判定只用**本回合增量**消息
+        # （旧实现传全量历史 → corrected 信号从第二回合起恒真、lesson 可能
+        # 来自历史配对，沉淀几乎每回合都触发）
+        try:
+            n_msgs_before = len(store.load_messages(session_ref[0].id))
+        except Exception:                     # noqa: BLE001
+            n_msgs_before = 0
         try:
             result = _run_turn(app, session_ref[0], line, _ask_continue, images=images)
         except KeyboardInterrupt:
@@ -1662,11 +1673,17 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
             continue
         status.idle()
         _settle_interjections(app, session_ref[0])
+        # v0.4.27：**中断的回合不沉淀**——Ctrl+C 被 AgentLoop.run 吞成
+        # user_interrupt 返回（repl 层看不到异常），旧实现照常触发 L1 →
+        # 又开一个完整沉淀回合，继承毒上下文再次陷循环
+        # （用户实测"Ctrl+C 后还在沉淀里出不来"）
+        if getattr(result, "stop_reason", "") == "user_interrupt":
+            continue
         # L1 触发式沉淀（v0.4.24）：有信号（失败恢复/打转/插嘴纠正/自检⚠）
         # 才调模型写本回合教训；L0 规则式教训已随进度日志注入，无需模型
         try:
-            _maybe_note_turn(app, session_ref[0],
-                             store.load_messages(session_ref[0].id), result)
+            turn_msgs = store.load_messages(session_ref[0].id)[n_msgs_before:]
+            _maybe_note_turn(app, session_ref[0], turn_msgs, result)
         except Exception:                     # noqa: BLE001 - 沉淀失败不阻塞对话
             pass
 
