@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/gufengaoyue/axon"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-gufengaoyue%2Faxon-181717?logo=github"></a>
   <a href="https://pypi.org/project/ai-agent-axon/"><img alt="PyPI" src="https://img.shields.io/badge/PyPI-ai--agent--axon-3775A9?logo=pypi&logoColor=white"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.4.24-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.25-blue">
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -62,6 +62,8 @@ Axon 是一个**在你的电脑上本地运行**的 AI 智能体。它不是一�
 | ⚡ **并行执行**         | 底层 CLI **默认并发执行**同一条消息里的多个工具调用（已实证）；提示词引导模型把无依赖子任务放进同消息（3–5 个），有依赖的步骤等上游结果；**并发审批互斥锁**保证多个「询问」不错串（防误批准）                                        |
 | 🧠 **思考可见**         | 模型的思考/决策过程实时呈现（`💭` 前缀 + 弱化样式，穿插在工具调用之间）；codebuddy 路取 SDK `ThinkingBlock`（**流式**：SSE thinking_delta 逐字播出），openai 路取 `reasoning_content`；过长自动折叠首尾；`agent.show_thinking` 可关 |
 | 📊 **可观测**           | 状态行（转圈 + 计时 + 操作概要轮换）、工具行动线、审计日志 `/audit` 与导出                                                                                                                                                                      |
+| 🎨 **生图模型入口** | 文生图/图生图**独立接入口**（`image_gen` 配置段，OpenAI 兼容 images API：generations=文生图 / edits=图生图）——**只有显式生图任务才调用**，调用时终端 🖼 特别提醒；未配置或失败 → 放弃任务并告知用户，**禁止**用无生图能力的模型冒充生成图片 |
+| 🧯 **中断即恢复** | `Ctrl+C` 中断后**立即停止转圈/思考框**（修复 rich Live 刷新线程在中断后持续重绘终端导致的"一直转圈"）；看门狗线程停止时 join，杜绝"停止后又转起来"的竞态 |
 
 ---
 
@@ -288,6 +290,7 @@ Axon 会：搜索文件 → 逐个阅读 → 给出总结，并把这次交互�
 | `tools.max_download_mb`          | `100`       | 单文件下载上限                                        |
 | `tools.cleanup_temp_each_turn`   | `true`      | 回合结束清理临时文件                                  |
 | `tools.clipboard_auto_attach`    | `false`     | 每次输入都读剪贴板（默认改为主粘贴动作触发）          |
+| `image_gen.model` / `.base_url`  | 空（未配置） | 生图模型入口（v0.4.25）：两者必填才启用；`api_key_env` 默认 `IMAGE_GEN_API_KEY` |
 
 ---
 

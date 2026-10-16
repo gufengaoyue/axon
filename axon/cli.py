@@ -123,6 +123,7 @@ class StatusLine:
         self._notes: list[str] = []    # 操作概要轮换（v0.2.4）
         self._note_idx = 0
         self.keyboard = None           # InterjectReader（v0.2.6：执行中插嘴回显）
+        self.image_model = ""          # 生图模型名（v0.4.25：调用时特别提醒用）
         self._last_event = 0.0         # 最近一次事件时间（看门狗用，v0.4.5）
         self._thinking_open = False    # 思考行是否打开（增量流式，v0.4.12）
         self._live_active = False      # rich Live 是否独占终端（v0.4.20）
@@ -270,8 +271,12 @@ class StatusLine:
         self._watchdog.start()
 
     def stop_watchdog(self) -> None:
+        # v0.4.25：join 看门狗线程再返回——否则竞态下它可能在 stop 之后
+        # 仍调用 thinking() 重启转圈（"停止后又转起来"），且该线程无人再停。
         self._watching = False
-        self._watchdog = None
+        t, self._watchdog = self._watchdog, None
+        if t is not None:
+            t.join(timeout=0.5)
 
     def text(self) -> None:
         self._stop()
@@ -479,6 +484,17 @@ class StatusLine:
         """工具行动线：连续同类只打一行（v0.2.3 降噪，避免几十条重复刷屏）。"""
         self._stop()
         self.ensure_newline()
+        # v0.4.25：生图模型调用**特别提醒**（用户要求：调用生图模型时要明确告知）——
+        # 生图按次计费且与日常对话模型不同，必须让用户立刻看到。
+        if name == "image_generate":
+            model = getattr(self, "image_model", "") or "生图模型"
+            self._flush_tool_run()
+            self._print(f"🖼 正在调用生图模型 {model} 生成图片（文生图/图生图）…",
+                        style="magenta")
+            self._notes = [f"正在调用生图模型 {model} 生成图片…"]
+            self._msg = self._notes[0]
+            self._start()
+            return
         if name == self._last_tool:
             self._last_tool_count += 1
             if not self._running:          # v0.3.0 修复：合并分支曾让转圈永久停下
@@ -547,6 +563,11 @@ class StatusLine:
             self._print(ln, style="dim")
 
     def idle(self) -> None:
+        # v0.4.25：先收思考滚动框——rich Live 自带 ~8Hz 自动刷新线程，
+        # 中断（Ctrl+C）或"只思考不输出"的回合结束后若不关闭，Live 会
+        # 在终端里无休止重绘面板（用户实测"中断后一直在转圈"），并与随后
+        # 的 prompt_toolkit 输入行互相覆盖。_close_thinking 幂等，无害。
+        self._close_thinking()
         self._stop()
         if self._last_tool:
             self.ensure_newline()
@@ -831,6 +852,10 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
         if interject is not None:
             interject.reset()
         app["loop"].status.stop_watchdog()
+        # v0.4.25：任何出口（正常/异常/Ctrl+C 中断）都收思考滚动框——
+        # Live 不关闭则其刷新线程持续重绘终端（用户实测"中断后一直转圈"），
+        # 且 _print_turn_result 的页脚会被 Live 覆盖。
+        st._close_thinking()
         if kb is not None:
             kb.stop()
         left = kb.current_input() if kb is not None else ""
@@ -1626,9 +1651,15 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
         try:
             result = _run_turn(app, session_ref[0], line, _ask_continue, images=images)
         except KeyboardInterrupt:
-            status.idle()
-            print("\n(回合被中断)")
-            _settle_interjections(app, session_ref[0])
+            # v0.4.25：收尾本身也要防二次 Ctrl+C 打断——_run_turn 的 finally
+            # 已停看门狗/关思考框；这里先 idle()（关 Live/停转圈/补断行）再提示，
+            # 若清理中又被 Ctrl+C，至少保证 idle() 重入一次把终端状态恢复。
+            try:
+                status.idle()
+                print("\n(回合被中断)")
+                _settle_interjections(app, session_ref[0])
+            except KeyboardInterrupt:
+                status.idle()
             continue
         status.idle()
         _settle_interjections(app, session_ref[0])
@@ -1811,6 +1842,10 @@ def main(argv: list[str] | None = None) -> int:
 
     console = _make_console()
     status = StatusLine(console)
+    # v0.4.25：生图模型名挂到状态行（调用 image_generate 时特别提醒用户）
+    _ig = getattr(cfg, "image_gen", None)
+    if _ig is not None and getattr(_ig, "configured", False):
+        status.image_model = str(_ig.model)
 
     # --repair-db：最优先处理——库坏了也要能修（v0.4.3）
     if args.repair_db:

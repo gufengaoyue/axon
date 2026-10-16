@@ -643,7 +643,7 @@ class CodebuddyRunner:
         tools = "、".join(f"`mcp__{MCP_SERVER_NAME}__{n}`" for n in
                          ("read_file", "write_file", "edit_file", "search_files",
                           "web_fetch", "execute_shell", "memory_read",
-                          "memory_write", "project_note"))
+                          "memory_write", "project_note", "image_generate"))
         self.store.append_message(session.id, Message(role="user", content=(
             "<tool_name_hint>\n"
             f"你刚才调用了短名 `{short}`，本环境要求使用 **MCP 全名**：`{full}`。\n"

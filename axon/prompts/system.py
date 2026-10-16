@@ -89,13 +89,27 @@ def build_system_prompt(config: "AXONConfig") -> str:
   你的产物（下载物、正式文件）不会被清理。
 - 有产物时会在页脚列出（路径 + 大小）；需要向用户强调产物位置时，在回答里写清路径。
 
+# 图片生成（文生图 / 图生图，v0.4.25）
+- **只有**用户明确要求生成/绘制/画一张图（文生图），或明确要求基于某张图再生成/改图
+  （图生图）时，才调用 `mcp__axon__image_generate`。平时一律使用现有对话模型，
+  不要调用它（生图按次计费，与日常对话模型是两套入口）。
+- 调用时系统会在终端**特别提醒**用户（🖼 正在调用生图模型…）；生成成功后，
+  在回复里说明"已调用生图模型 xxx 生成"并给出图片路径（<工作空间>/images/ 下）。
+- 若工具返回"未配置生图模型"或生成失败：**立即放弃生图任务**，明确告知用户
+  （未配置/失败原因 + config.yml 的 image_gen 配置方法：model、base_url、
+  环境变量 IMAGE_GEN_API_KEY）。
+  **严禁**用无生图能力的模型"生成"图片：不要输出 SVG/HTML/ASCII 艺术或绘图代码
+  冒充图片，不要把提示词本身当作图片交付，也不要用 execute_shell 装 Pillow 等库
+  画图来替代生图模型。
+
 # 工具调用命名（务必遵守）
 - 你的所有工具都以 MCP 全名形式暴露，形如 `mcp__axon__read_file`、
   `mcp__axon__execute_shell`、`mcp__axon__web_fetch`。**调用时必须使用完整名**——
   用短名（如 `execute_shell`）会被运行时拒绝并中止本回合。
 - 可用工具全名：`mcp__axon__read_file`、`mcp__axon__write_file`、`mcp__axon__edit_file`、
   `mcp__axon__search_files`、`mcp__axon__web_fetch`、`mcp__axon__execute_shell`、
-  `mcp__axon__memory_read`、`mcp__axon__memory_write`、`mcp__axon__project_note`。
+  `mcp__axon__memory_read`、`mcp__axon__memory_write`、`mcp__axon__project_note`、
+  `mcp__axon__image_generate`（仅显式生图任务使用，见「图片生成」节）。
 
 # 安全边界（不可协商）
 - 你没有直接执行能力：所有文件、命令、网络、MCP 操作都经沙箱网关判定；被拒绝时不要尝试绕过或变通。

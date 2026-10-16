@@ -217,10 +217,43 @@ class ModelConfig:
         ),
         "openai": ProviderCfg(
             env_api_key="OPENAI_API_KEY",
-            base_url=os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1",
-            default_model="gpt-4o-mini",
+            base_url="OPENAI_BASE_URL",
+            default_model="qwen3.7-flash",
         ),
     })
+
+
+@dataclass
+class ImageGenConfig:
+    """生图模型接入（v0.4.25）：文生图 / 图生图**独立入口**。
+
+    用户红线：
+    - 只有**显式的生图任务**才调用生图模型；平时仍用现有对话模型
+    - 未配置（model/base_url 为空）或调用失败 → 放弃生图任务并告知用户，
+      **禁止**用无生图能力的模型"生成"图片（prompt 规则层兜底）
+    - 协议：OpenAI 兼容 images API（generations=文生图；edits=图生图），
+      覆盖 OpenAI DALL·E / 火山方舟 Seedream / SiliconFlow / 本地兼容服务
+    """
+    enabled: bool = True                  # 总开关；false = 工具直接返回"未配置"
+    provider: str = "openai_compat"       # 预留：目前仅 openai_compat 一种
+    base_url: str = ""                    # 例: https://ark.cn-beijing.volces.com/api/v3
+    api_key_env: str = "IMAGE_GEN_API_KEY"    # 环境变量名（推荐，不落盘）
+    api_key: str = ""                     # 或直接填 key 值（兼容写法，会留在配置文件里）
+    model: str = ""                       # 生图模型名，如 doubao-seedream-4-0-250828
+    size: str = "1024x1024"               # 默认尺寸
+    timeout_sec: float = 180.0
+    out_dir: str = "images"               # 生成图落盘目录（相对 workspace）
+
+    @property
+    def configured(self) -> bool:
+        """是否具备调用条件（model + endpoint 必填；key 可缺省——本地服务免鉴权）。"""
+        return bool(self.model) and bool(self.base_url)
+
+    def resolve_key(self) -> str | None:
+        """解析 API key：直接值 > 环境变量名（与 ProviderCfg 同一套口径）。"""
+        if self.api_key:
+            return self.api_key
+        return resolve_api_key(self.api_key_env)
 
 
 @dataclass
@@ -365,6 +398,7 @@ class AXONConfig:
     workspace: Path
     project: Path
     model: ModelConfig = field(default_factory=ModelConfig)
+    image_gen: ImageGenConfig = field(default_factory=ImageGenConfig)   # v0.4.25 生图入口
     context: ContextConfig = field(default_factory=ContextConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -578,6 +612,20 @@ def load_config(path: str | Path | None = None,
         cur.timeout_sec = float(p.get("timeout_sec", cur.timeout_sec))
         cur.cli_port = int(p.get("cli_port", cur.cli_port))
         cfg.model.providers[name] = cur
+
+    # ---- 生图模型接入（v0.4.25）----
+    ig = raw.get("image_gen", {}) or {}
+    cfg.image_gen = ImageGenConfig(
+        enabled=bool(ig.get("enabled", cfg.image_gen.enabled)),
+        provider=str(ig.get("provider", cfg.image_gen.provider) or "openai_compat"),
+        base_url=str(ig.get("base_url", "") or "").strip(),
+        api_key_env=str(ig.get("api_key_env", cfg.image_gen.api_key_env) or ""),
+        api_key=str(ig.get("api_key", "") or "").strip(),
+        model=str(ig.get("model", "") or "").strip(),
+        size=str(ig.get("size", cfg.image_gen.size) or "1024x1024"),
+        timeout_sec=float(ig.get("timeout_sec", cfg.image_gen.timeout_sec)),
+        out_dir=str(ig.get("out_dir", cfg.image_gen.out_dir) or "images"),
+    )
 
     c = raw.get("context", {}) or {}
     cfg.context.compact_warn_ratio = float(c.get("compact_warn_ratio", cfg.context.compact_warn_ratio))

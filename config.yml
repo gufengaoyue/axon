@@ -36,9 +36,25 @@ model:
                                # （CLI 默认 57521，易与本机 CodeBuddy IDE 服务冲突）
     openai:
       env_api_key: OPENAI_API_KEY
-      base_url: https://api.openai.com/v1   # 任意 OpenAI 兼容端点
+      base_url: OPENAI_BASE_URL   # 任意 OpenAI 兼容端点
       default_model: gpt-4o-mini            # 示例值，用户自选
       timeout_sec: 180
+
+# ============ 生图模型接入（v0.4.25；文生图/图生图独立入口） ============
+# 只有**显式的生图任务**才调用这里配置的模型；平时仍用上面的对话模型。
+# 调用时终端会特别提醒（🖼 正在调用生图模型…）；未配置或失败 → 放弃生图任务
+# 并告知用户（禁止用无生图能力的模型冒充生成图片）。
+# 协议：OpenAI 兼容 images API（generations=文生图 / edits=图生图），
+# 适用于 OpenAI DALL·E、火山方舟 Seedream、SiliconFlow、本地兼容服务等。
+image_gen:
+  enabled: true
+  base_url: ""                 # 例：https://ark.cn-beijing.volces.com/api/v3
+  api_key_env: IMAGE_GEN_API_KEY   # 环境变量名（推荐；set IMAGE_GEN_API_KEY=... ）
+  # api_key: ""                # 或直接填 key 值（不推荐：会留在配置文件里）
+  model: ""                    # 生图模型名，如 doubao-seedream-4-0-250828 / dall-e-3
+  size: "1024x1024"            # 默认尺寸
+  timeout_sec: 180
+  out_dir: images              # 生成图落盘目录（相对 workspace）
 
 context:
   compact_warn_ratio: 0.8       # 80% 水位：清理最旧工具输出（留占位）

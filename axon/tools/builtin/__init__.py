@@ -1,4 +1,4 @@
-"""内置工具包：build_builtin_registry(ctx) 注册 8 个工具（设计 §4.2）。"""
+"""内置工具包：build_builtin_registry(ctx) 注册 9 个工具（设计 §4.2）。"""
 from __future__ import annotations
 
 from axon.tools.context import ToolContext
@@ -7,7 +7,7 @@ from axon.tools.registry import ToolRegistry
 
 def build_builtin_registry(ctx: ToolContext) -> ToolRegistry:
     from axon.tools.builtin import (file_edit, file_read, file_search,
-                                      file_write, memory, shell, web_fetch)
+                                      file_write, image, memory, shell, web_fetch)
     reg = ToolRegistry()
     reg.register(file_read.make_spec(ctx))
     reg.register(file_write.make_spec(ctx))
@@ -19,4 +19,5 @@ def build_builtin_registry(ctx: ToolContext) -> ToolRegistry:
     reg.register(memory.make_write_spec(ctx))
     reg.register(memory.make_global_spec(ctx))       # v0.4.21 系统级长期记忆
     reg.register(memory.make_note_spec(ctx))
+    reg.register(image.make_spec(ctx))               # v0.4.25 生图模型入口
     return reg
