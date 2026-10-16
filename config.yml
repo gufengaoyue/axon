@@ -50,6 +50,8 @@ agent:
   show_thinking: true           # 显示模型思考/决策过程（v0.4.11；💭 前缀、弱化样式）
   # max_turns: 50               # 单回合最大轮次（也可 --max-turns）
   # stuck_threshold: 3          # 打转检测阈值
+  # auto_note: trigger          # 本回合教训沉淀策略（v0.4.24）：
+  #   trigger=有信号才沉淀（默认）| always=每回合都沉淀 | off=关闭
 
 sandbox:
   backup:

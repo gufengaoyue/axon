@@ -353,6 +353,11 @@ class AgentLoopConfig:
     stuck_threshold: int = 3
     show_thinking: bool = True              # 显示模型思考/决策过程（v0.4.11）
     stream_interject: bool = True           # 插嘴执行中即时注入（v0.4.15；关则回退回合后确认）
+    # 记忆沉淀策略（v0.4.24，三层方案 L0/L1/L2）：
+    #   trigger = 有信号（失败恢复/打转中断/插嘴纠正/自检⚠）才调模型沉淀本回合教训（默认）
+    #   always  = 每回合结束都调模型沉淀（成本高：每回合多一次模型调用）
+    #   off     = 关闭 L1（L0 规则式教训 + L2 退出总结仍生效）
+    auto_note: str = "trigger"
 
 
 @dataclass
@@ -680,6 +685,7 @@ def load_config(path: str | Path | None = None,
         stuck_threshold=int(a.get("stuck_threshold", cfg.agent.stuck_threshold)),
         show_thinking=bool(a.get("show_thinking", cfg.agent.show_thinking)),
         stream_interject=bool(a.get('stream_interject', cfg.agent.stream_interject)),
+        auto_note=str(a.get('auto_note', cfg.agent.auto_note) or 'trigger'),
     )
 
     _validate(cfg)

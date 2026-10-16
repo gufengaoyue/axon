@@ -40,6 +40,41 @@ def rel_path(path: str, workspace=None, project=None) -> str:
     return s if len(s) <= 80 else "..." + s[-77:]
 
 
+def extract_lessons(turn_msgs) -> list[str]:
+    """L0 规则式教训（v0.4.24，零 token）：从工具事件流提取「失败→成功」配对。
+
+    场景（用户讨论确认）：第 1 回合 web_fetch 502 → 换 web_search 成功；
+    旧版只记「踩坑: web_fetch 502」（没有正确做法），第 2 回合会重蹈覆辙。
+    本函数把「失败 → 后续成功」的路径固化为可执行教训，写进进度日志，
+    **下一回合即随注入可见**。
+    """
+    events: list[tuple[str, str | None]] = []      # (工具短名, error_type)
+    pending = ""
+    for m in turn_msgs:
+        if getattr(m, "role", None) == "assistant" and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                pending = short_tool_name(tc.name)
+        elif getattr(m, "role", None) == "tool":
+            from axon.agent.msgmeta import unpack_meta
+            _, meta = unpack_meta(getattr(m, "content", None))
+            et = (meta or {}).get("error_type")
+            events.append((short_tool_name(getattr(m, "name", None) or pending), et))
+    lessons: list[str] = []
+    for i, (name, et) in enumerate(events):
+        if not et:
+            continue
+        for j in range(i + 1, len(events)):
+            n2, et2 = events[j]
+            if et2:
+                continue                          # 仍是失败，继续找成功点
+            if n2 == name:
+                lessons.append(f"{name} 失败({et})后重试成功")
+            else:
+                lessons.append(f"{name} 失败({et}) → 改用 {n2} 成功")
+            break
+    return lessons[:2]                            # 每回合最多 2 条，防注入膨胀
+
+
 class Journal:
     def __init__(self, memory_store, config=None):
         self.memory = memory_store
@@ -130,6 +165,10 @@ class Journal:
             entry += "\n- 自检: " + ("通过" if _ok and not flags else "；".join(acc_lines[:3]))
         if failures:
             entry += "\n- 踩坑: " + " ｜ ".join(failures[:4])
+        # L0 规则式教训（v0.4.24）：失败→成功配对，下一回合即可消费
+        lessons = extract_lessons(turn_msgs)
+        if lessons:
+            entry += "\n- 教训: " + " ｜ ".join(lessons)
         if cleaned:
             entry += f"\n- 清理: {len(cleaned)} 个临时文件"
         self.memory.append_journal(entry)

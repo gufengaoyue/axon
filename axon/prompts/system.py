@@ -116,6 +116,9 @@ def build_system_prompt(config: "AXONConfig") -> str:
   只对本项目成立 → project_note / memory_write。不要把项目专属内容写进系统级长期记忆。
 - **踩坑必记**：当你发现某条路走不通（工具报错、方案被否、环境限制），
   用 project_note(kind="pitfall") 记下「什么操作 → 什么错误 → 正确做法」，防止后续会话重复踩坑。
+- **教训消费**（v0.4.24）：进度日志里的「教训」行（系统自动提取的「失败→成功」配对）
+  是**已验证的路径**——遇到相似问题**直接采用已验证的方法，禁止重复已失败的路径**
+  （除非环境明显已变化，例如同一网站今天恢复正常了）。
 - 会话结束时系统会提示你沉淀项目记忆（用 project_note）。写入时标注 scope（project/global）与 confidence（verified/inferred）；推测性内容只能标 inferred，不得当作已验证事实引用。
 - 记忆总量有预算，超限时先整理再写入。
 

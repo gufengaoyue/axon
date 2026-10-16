@@ -1208,6 +1208,77 @@ def _recover_stale_sessions(app: dict, current) -> None:
         store.set_status(s.id, "ended")
 
 
+TURN_NOTE_PROMPT = """\
+请为**本回合**沉淀值得记住的内容（调用 project_note 工具，通常 1-3 次）：
+- kind=pitfall：本回合踩过的坑（格式：什么操作 → 什么错误 → **正确做法**），
+  尤其"失败后换方法成功"的路径——这是后续会话最需要的
+- kind=decision：本回合的关键决策与可复用经验（每条一行）
+- kind=preference：用户在本回合明确表达的偏好（如有）
+
+要求：只写有依据的内容，不编造；每项一行、简洁；**没有值得记的就不要调用工具**，
+直接回复"无需沉淀"三个字。"""
+
+
+def _note_signals(app: dict, session, turn_msgs, turn_result) -> list[str]:
+    """L1 触发信号检测（v0.4.24，纯函数可单测）。
+
+    返回信号列表（非空 = 值得沉淀）：
+    - lesson      ：本回合有「失败→成功」配对（L0 规则可提取的教训）
+    - stuck       ：原地打转被中断（最强教训信号）
+    - corrected   ：回合内用户插嘴/追加输入（通常意味着纠正或补充）
+    - warn        ：完成度自检有 ⚠/ℹ（可能未完成或有偏差）
+    """
+    from axon.memory.journal import extract_lessons
+    signals: list[str] = []
+    if extract_lessons(turn_msgs):
+        signals.append("lesson")
+    if getattr(turn_result, "stop_reason", "") == "stuck_break":
+        signals.append("stuck")
+    n_user = sum(1 for m in turn_msgs
+                 if getattr(m, "role", None) == "user"
+                 and not str(m.content or "").startswith(("<resume_context>", "<verification",
+                                                          "<interrupted_task>")))
+    if n_user > 1:
+        signals.append("corrected")
+    acc = getattr(turn_result, "acceptance", ()) or ()
+    if acc:
+        _ok, acc_lines = acc
+        if any(ln.startswith(("⚠", "ℹ")) for ln in acc_lines):
+            signals.append("warn")
+    return signals
+
+
+def _maybe_note_turn(app: dict, session, turn_msgs, turn_result) -> None:
+    """L1 触发式沉淀（v0.4.24）：回合结束，有信号才调模型写本回合教训。
+
+    - auto_note=trigger（默认）：按 _note_signals 判定
+    - auto_note=always：每回合都沉淀
+    - auto_note=off：关闭（L0 规则式 + L2 退出总结仍生效）
+    """
+    cfg = app["cfg"]
+    mode = str(getattr(cfg.agent, "auto_note", "trigger") or "off").lower()
+    if mode == "off":
+        return
+    if mode == "always":
+        signals = ["always"]
+    else:
+        signals = _note_signals(app, session, turn_msgs, turn_result)
+        if not signals:
+            return
+    console = app.get("console")
+    line = f"── 正在沉淀本回合教训（信号：{'/'.join(signals)}）…"
+    if console is not None:
+        console.print(line, style="dim", markup=False)
+    else:  # pragma: no cover
+        print(line)
+    try:
+        _run_turn(app, session, TURN_NOTE_PROMPT, _ask_continue)
+    except Exception as e:  # noqa: BLE001 - 沉淀失败不阻塞主流程
+        if console is not None:
+            console.print(f"── 本回合教训沉淀失败（不影响使用）: {type(e).__name__}: {e}",
+                          style="yellow", markup=False)
+
+
 def _maybe_summarize(app: dict, session) -> None:
     """会话结束沉淀项目记忆（v0.2.3，用户审定）。"""
     cfg = app["cfg"]
@@ -1553,12 +1624,21 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
             line += attachments.build_attachment_note(pending_attach)
             pending_attach = []
         try:
-            _run_turn(app, session_ref[0], line, _ask_continue, images=images)
+            result = _run_turn(app, session_ref[0], line, _ask_continue, images=images)
         except KeyboardInterrupt:
             status.idle()
             print("\n(回合被中断)")
+            _settle_interjections(app, session_ref[0])
+            continue
         status.idle()
         _settle_interjections(app, session_ref[0])
+        # L1 触发式沉淀（v0.4.24）：有信号（失败恢复/打转/插嘴纠正/自检⚠）
+        # 才调模型写本回合教训；L0 规则式教训已随进度日志注入，无需模型
+        try:
+            _maybe_note_turn(app, session_ref[0],
+                             store.load_messages(session_ref[0].id), result)
+        except Exception:                     # noqa: BLE001 - 沉淀失败不阻塞对话
+            pass
 
 
 def handle_slash(app: dict, session, line: str, state: dict, ps) -> object | None:
