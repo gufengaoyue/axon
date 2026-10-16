@@ -761,9 +761,8 @@ def _print_turn_result(console, r: TurnResult, elapsed: float | None = None) -> 
         if r.note:
             console.print(f"── {r.note}", style="yellow", markup=False)
             if r.stop_reason == "provider_error":
-                console.print("── 排查建议：确认模型提供商可用（codebuddy 路检查 "
-                              "CODEBUDDY_API_KEY / CODEBUDDY_INTERNET_ENVIRONMENT 与网络）；"
-                              "或临时切换 openai 路（--provider openai）", style="dim",
+                console.print("── 排查建议：见上方失败详情（端点/模型/密钥/代理）；"
+                              "也可用 --provider 切换接入路重试", style="dim",
                               markup=False)
         if r.products:
             console.print("── 本轮产物：", style="bold cyan", markup=False)
@@ -1812,6 +1811,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", choices=["codebuddy", "openai"],
                         help="模型接入路（覆盖配置）")
     parser.add_argument("--model", help="模型名（覆盖配置）")
+    parser.add_argument("--base-url", dest="base_url",
+                        help="临时覆盖当前 provider 的 API 端点（v0.4.26；openai 路生效，"
+                             "如 https://dashscope.aliyuncs.com/compatible-mode/v1）")
     parser.add_argument("--repair-db", action="store_true",
                         help=("检测并修复会话数据库（损坏时自动备份坏库并尽力重建；"
                               "不需要 API key）"))
@@ -1833,6 +1835,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.config, overrides={
             "workspace": args.workspace, "project": args.project,
             "active_provider": args.provider, "model": args.model,
+            "base_url": args.base_url,
             "max_turns": args.max_turns,
         })
         ensure_dirs(cfg)   # workspace/project/临时目录必须存在

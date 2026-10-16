@@ -22,6 +22,17 @@ class OpenAICompatProvider:
             from openai import OpenAI
         except ImportError as e:  # pragma: no cover
             raise RuntimeError("需要 openai 包：pip install openai") from e
+        # v0.4.26：base_url 支持「环境变量名」间接（config.resolve_base_url 展开）；
+        # 展开后仍形如变量名 = 该变量未设置 → fail-fast 给可操作错误，
+        # 而不是把 "OPENAI_BASE_URL" 当主机名去连（用户实测 APIConnectionError 根因）
+        if base_url:
+            from axon.config import looks_like_unset_env_name
+            if looks_like_unset_env_name(base_url):
+                raise RuntimeError(
+                    f"base_url 填写的 {base_url} 形如环境变量名，但该变量未设置"
+                    f"（不会被展开）。请 set {base_url}=<端点URL>，或直接在 "
+                    f"config.yml 的 model.providers.openai.base_url 写端点 URL"
+                    f"（如 https://dashscope.aliyuncs.com/compatible-mode/v1）")
         self._client = OpenAI(
             api_key=api_key,
             base_url=base_url or None,

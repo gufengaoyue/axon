@@ -36,7 +36,13 @@ model:
                                # （CLI 默认 57521，易与本机 CodeBuddy IDE 服务冲突）
     openai:
       env_api_key: OPENAI_API_KEY
-      base_url: OPENAI_BASE_URL   # 任意 OpenAI 兼容端点
+      # base_url 两种写法（v0.4.26）：① 写环境变量名（如下，默认形式）——
+      #   set OPENAI_BASE_URL=<端点> 即生效，未设置会在启动时给出可操作报错；
+      # ② 直接写端点 URL（**yml 里的显式值优先于环境变量**）。
+      # 注意：qwen/deepseek/glm 等非 OpenAI 官方模型必须用对应服务商的兼容端点，
+      # 如 DashScope：https://dashscope.aliyuncs.com/compatible-mode/v1
+      # （key 用该服务商颁发的密钥；也可 --base-url 临时覆盖，优先级最高）
+      base_url: OPENAI_BASE_URL
       default_model: gpt-4o-mini            # 示例值，用户自选
       timeout_sec: 180
 

@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/gufengaoyue/axon"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-gufengaoyue%2Faxon-181717?logo=github"></a>
   <a href="https://pypi.org/project/ai-agent-axon/"><img alt="PyPI" src="https://img.shields.io/badge/PyPI-ai--agent--axon-3775A9?logo=pypi&logoColor=white"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.4.25-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.26-blue">
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -64,6 +64,7 @@ Axon 是一个**在你的电脑上本地运行**的 AI 智能体。它不是一�
 | 📊 **可观测**           | 状态行（转圈 + 计时 + 操作概要轮换）、工具行动线、审计日志 `/audit` 与导出                                                                                                                                                                      |
 | 🎨 **生图模型入口** | 文生图/图生图**独立接入口**（`image_gen` 配置段，OpenAI 兼容 images API：generations=文生图 / edits=图生图）——**只有显式生图任务才调用**，调用时终端 🖼 特别提醒；未配置或失败 → 放弃任务并告知用户，**禁止**用无生图能力的模型冒充生成图片 |
 | 🧯 **中断即恢复** | `Ctrl+C` 中断后**立即停止转圈/思考框**（修复 rich Live 刷新线程在中断后持续重绘终端导致的"一直转圈"）；看门狗线程停止时 join，杜绝"停止后又转起来"的竞态 |
+| 🔌 **端点灵活切换** | `--base-url` 临时覆盖端点；`base_url` 支持**环境变量名间接**（写 `OPENAI_BASE_URL` 自动展开，未设置启动时报可操作错误）；模型调用失败（连接/401/404/429/400）给出**分型排查话术**——端点与模型名错配（如 qwen 打到 api.openai.com）、代理环境变量陷阱都会明确指出，不再裸 traceback |
 
 ---
 
@@ -152,6 +153,7 @@ Axon 会：搜索文件 → 逐个阅读 → 给出总结，并把这次交互�
 | `--workspace PATH`            | 单独指定工作空间                                                                          |
 | `--provider codebuddy\|openai` | 覆盖模型接入路                                                                            |
 | `--model NAME`                | 覆盖模型名                                                                                |
+| `--base-url URL`              | 临时覆盖当前 provider 的 API 端点（v0.4.26；openai 路生效，换服务商试模型不必改 config.yml） |
 | `--resume [ID\|last]`          | 恢复会话；不带值则列出最近会话供选择（**跨项目生效**）                              |
 | `--delproj [项目]`            | 删除项目（列出 / 按序号 / 名称 / 目录 / session 前缀）；`--with-files` 连目录移入回收站 |
 | `--repair-db`                 | 检测并修复会话数据库（损坏时自动备份坏库、按 schema 重建、逐行救回；不需要 API key）      |
@@ -291,6 +293,7 @@ Axon 会：搜索文件 → 逐个阅读 → 给出总结，并把这次交互�
 | `tools.cleanup_temp_each_turn`   | `true`      | 回合结束清理临时文件                                  |
 | `tools.clipboard_auto_attach`    | `false`     | 每次输入都读剪贴板（默认改为主粘贴动作触发）          |
 | `image_gen.model` / `.base_url`  | 空（未配置） | 生图模型入口（v0.4.25）：两者必填才启用；`api_key_env` 默认 `IMAGE_GEN_API_KEY` |
+| `model.providers.openai.base_url` | `https://api.openai.com/v1` | OpenAI 兼容端点；支持环境变量名（如 `OPENAI_BASE_URL`，自动展开）；qwen 等模型须改为对应服务商兼容端点（如 DashScope） |
 
 ---
 

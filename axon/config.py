@@ -217,7 +217,7 @@ class ModelConfig:
         ),
         "openai": ProviderCfg(
             env_api_key="OPENAI_API_KEY",
-            base_url="OPENAI_BASE_URL",
+            base_url=os.environ.get("OPENAI_BASE_URL",''),
             default_model="qwen3.7-flash",
         ),
     })
@@ -539,6 +539,56 @@ def resolve_api_key(spec: str | None) -> str | None:
     return None
 
 
+# CLI 覆盖写进「当前 provider」段时，缺省段先按已知默认补齐（v0.4.26：
+# 修复 `--model`/`--base-url` 在「只写 active_provider、无 providers 段」的
+# 配置上 KeyError 的潜在 bug）
+_PROVIDER_DEFAULTS = {
+    "codebuddy": {"env_api_key": "CODEBUDDY_API_KEY",
+                  "env_environment": "CODEBUDDY_INTERNET_ENVIRONMENT"},
+    "openai": {"env_api_key": "OPENAI_API_KEY",
+               "base_url": "https://api.openai.com/v1"},
+}
+
+
+def resolve_base_url(value: str) -> str:
+    """base_url 解析：支持「环境变量名」间接写法（v0.4.26）。
+
+    背景（用户实测 `openai.APIConnectionError: Connection error.`）：用户把
+    `env_api_key` 的「填环境变量名」惯例套用到 base_url——配置里写
+    `base_url: OPENAI_BASE_URL` 并 `set OPENAI_BASE_URL=<端点>`，但旧实现把
+    **字面量当主机名** → DNS 解析 "OPENAI_BASE_URL" 失败 → 连接错误。
+    规则：
+    - 含 `://` 或含 `.`（URL 特征，如 https://… / 127.0.0.1:8000）→ 原样使用
+    - 形如变量名（全大写 + 数字/下划线）→ 取环境变量的值；**未设置则原样返回**
+      （不在此处 fail-fast——配置加载不该被单个字段炸掉；由
+      `OpenAICompatProvider` 构造时检查并报可操作错误，见 openai_compat.py）
+    - 其他（小写主机名等）→ 原样使用
+    """
+    v = str(value or "").strip()
+    if not v or "://" in v or "." in v:
+        return v
+    if v.isupper() and v.replace("_", "").isalnum():
+        return os.environ.get(v) or v
+    return v
+
+
+def looks_like_unset_env_name(value: str) -> bool:
+    """是否「形如环境变量名但不是 URL」——provider 构造时据此 fail-fast。"""
+    v = str(value or "").strip()
+    return bool(v) and "://" not in v and "." not in v \
+        and v.isupper() and v.replace("_", "").isalnum()
+
+
+def _override_provider_field(raw: dict, key: str, value) -> None:
+    """把 CLI 覆盖写进 raw 的当前 provider 段（段不存在则先按已知默认建）。"""
+    model = raw.setdefault("model", {})
+    name = str(model.get("active_provider", "codebuddy"))
+    entry = model.setdefault("providers", {}).setdefault(name, {})
+    for k, v in _PROVIDER_DEFAULTS.get(name, {}).items():
+        entry.setdefault(k, v)
+    entry[key] = value
+
+
 def load_config(path: str | Path | None = None,
                 overrides: dict | None = None) -> AXONConfig:
     """加载 config.yml；path=None 时按查找链定位，找不到用纯默认（v0.4.7）。
@@ -571,9 +621,11 @@ def load_config(path: str | Path | None = None,
         if overrides.get("active_provider"):
             raw.setdefault("model", {})["active_provider"] = overrides["active_provider"]
         if overrides.get("model"):
-            raw.setdefault("model", {}).setdefault("providers", {})[
-                raw.get("model", {}).get("active_provider",
-                                         "codebuddy")]["default_model"] = overrides["model"]
+            _override_provider_field(raw, "default_model", overrides["model"])
+        if overrides.get("base_url"):
+            # v0.4.26：--base-url 临时覆盖当前 provider 的端点（换服务商试模型时
+            # 不必改 config.yml；openai 路生效，codebuddy 路忽略）
+            _override_provider_field(raw, "base_url", overrides["base_url"])
         if overrides.get("max_turns"):
             raw.setdefault("agent", {})["max_turns"] = overrides["max_turns"]
 
@@ -607,7 +659,7 @@ def load_config(path: str | Path | None = None,
         cur = cfg.model.providers.get(name, ProviderCfg())
         cur.env_api_key = p.get("env_api_key", cur.env_api_key)
         cur.env_environment = p.get("env_environment", cur.env_environment)
-        cur.base_url = p.get("base_url", cur.base_url)
+        cur.base_url = resolve_base_url(p.get("base_url", cur.base_url))
         cur.default_model = p.get("default_model", cur.default_model)
         cur.timeout_sec = float(p.get("timeout_sec", cur.timeout_sec))
         cur.cli_port = int(p.get("cli_port", cur.cli_port))

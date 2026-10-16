@@ -360,18 +360,28 @@ class AgentLoop:
                     if on_thinking:
                         on_thinking(t)
 
-                for ev in self.provider.chat(
-                        ctx.messages, ctx.tools, model=session.model,
-                        timeout=self.config.agent.model_timeout_sec):
-                    if ev.kind == "text":
-                        text_parts.append(ev.text)
-                        _ot(ev.text)
-                    elif ev.kind == "thinking":
-                        _oth(ev.text)
-                    elif ev.kind == "tool_call" and ev.tool_call is not None:
-                        tool_calls.append(ev.tool_call)
-                    elif ev.kind == "usage":
-                        usage = ev.usage
+                # v0.4.26（用户实测 openai 路裸 traceback）：连接/鉴权/模型不存在等
+                # SDK 异常统一转 provider_error + 排查话术——不再把 Python 栈泼到终端。
+                # KeyboardInterrupt 是 BaseException，不被 except Exception 捕获，
+                # 仍走外层 except → user_interrupt 语义不变。
+                try:
+                    for ev in self.provider.chat(
+                            ctx.messages, ctx.tools, model=session.model,
+                            timeout=self.config.agent.model_timeout_sec):
+                        if ev.kind == "text":
+                            text_parts.append(ev.text)
+                            _ot(ev.text)
+                        elif ev.kind == "thinking":
+                            _oth(ev.text)
+                        elif ev.kind == "tool_call" and ev.tool_call is not None:
+                            tool_calls.append(ev.tool_call)
+                        elif ev.kind == "usage":
+                            usage = ev.usage
+                except Exception as e:  # noqa: BLE001 - SDK/传输异常 → 可操作的失败结论
+                    return TurnResult("".join(text_parts), "provider_error", turns,
+                                      tokens_used, self._side_effects(session),
+                                      note=_friendly_provider_error(
+                                          e, self.config, session.model))
                 text = "".join(text_parts)
                 tokens_used += int(usage.get("prompt_tokens", 0)) + \
                     int(usage.get("completion_tokens", 0))
@@ -469,3 +479,67 @@ class AgentLoop:
 
 def _target_of(args: dict) -> str:
     return str(args.get("path") or args.get("command") or args.get("url") or "")[:80]
+
+
+# 非 OpenAI 官模的模型名特征（"端点 vs 模型名"错配检测用，v0.4.26）
+_NON_OPENAI_MODEL_HINTS = ("qwen", "deepseek", "glm", "moonshot", "kimi", "ernie",
+                           "doubao", "hunyuan", "minimax", "yi-", "baichuan",
+                           "spark", "sensechat", "command-r", "llama", "mistral")
+
+
+def _friendly_provider_error(exc: BaseException, cfg, model: str = "") -> str:
+    """openai SDK（及兼容层）异常 → 可操作的中文说明（v0.4.26）。
+
+    用户实测：`axon --provider openai --model qwen3.7-flash` 时
+    `openai.APIConnectionError: Connection error.` 以裸 traceback 泼屏——
+    根因是 openai 路的异常在 AgentLoop 无人捕获（只捕 KeyboardInterrupt）。
+    调用方（_run）已把异常转成 provider_error；这里按异常类型给出排查路径，
+    连接错误额外指出「端点 vs 模型名」错配（qwen 等模型打到 api.openai.com
+    必然连不上）与代理环境变量陷阱（httpx 默认读 HTTP(S)_PROXY）。
+    """
+    import os
+    name = type(exc).__name__
+    head = f"{name}: {exc}"
+    prov = cfg.active_provider_cfg() if cfg is not None else None
+    prov_name = str(getattr(cfg.model, "active_provider", "")) if cfg else ""
+    base_url = str(getattr(prov, "base_url", "") or "")
+    tail: list[str] = []
+    if name in ("APIConnectionError", "ConnectError", "ConnectionError",
+                "APITimeoutError", "TimeoutException"):
+        tail.append("无法连接模型端点。请依次排查：")
+        tail.append(f"① 端点：当前 base_url = {base_url or '(未配置)'}"
+                    f"（config.yml → model.providers.{prov_name}.base_url，"
+                    "或用 --base-url 临时指定）")
+        if model:
+            tail.append(f"② 模型：{model}——请确认它属于该端点所属的服务商")
+        if model and base_url and "api.openai.com" in base_url and \
+                any(h in model.lower() for h in _NON_OPENAI_MODEL_HINTS):
+            tail.append(f"③ ⚠ 端点/模型不匹配：{model} 不是 OpenAI 官方模型，"
+                        "打到 api.openai.com 既连不上也找不到模型。qwen 系应改用 "
+                        "DashScope 兼容端点 https://dashscope.aliyuncs.com/compatible-mode/v1"
+                        "（key 用 DashScope 颁发的 sk-...，设为 OPENAI_API_KEY）")
+        proxies = {k: os.environ.get(k) for k in
+                   ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+                   if os.environ.get(k)}
+        if proxies:
+            k0 = next(iter(proxies))
+            tail.append(f"④ ⚠ 检测到代理环境变量 {sorted(proxies)}（如 {k0}={proxies[k0]}）——"
+                        "httpx 会走该代理；若是已失效的本地代理，清空后重试"
+                        "（set HTTP_PROXY= & set HTTPS_PROXY=）")
+        else:
+            tail.append("③ 网络：确认本机能访问该端点（公司网/代理需自行配置）")
+    elif name == "AuthenticationError":
+        tail.append("API key 无效或未授权（401）。请检查该服务商颁发的密钥是否已设为 "
+                    f"{getattr(prov, 'env_api_key', 'OPENAI_API_KEY')} 环境变量")
+    elif name == "NotFoundError":
+        tail.append(f"端点或模型不存在（404）。请核对 base_url（{base_url or '未配置'}）"
+                    f"与模型名（{model or '?'}）是否匹配——模型名是否属于该服务商、"
+                    "是否拼错")
+    elif name == "RateLimitError":
+        tail.append("触发限额（429）。稍后重试，或到服务商控制台检查额度")
+    elif name == "BadRequestError":
+        tail.append("请求被拒绝（400）。常见于模型名不被该端点支持、参数越界"
+                    "（max_tokens 超上限）、或多模态格式不被支持")
+    else:
+        tail.append("模型调用异常。请核对端点/密钥/网络后重试；持续失败可带此信息反馈")
+    return head + "\n" + "\n".join(tail)
