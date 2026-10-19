@@ -73,7 +73,9 @@ def canonical_json(obj) -> str:
 _CACHE_EXEMPT_RULES = (
     "command:batch_delete", "command:delete_unbounded", "command:delete_outside",
     "command:system_path", "command:fs_root", "command:deny_program_dir",
-    "command:deny_path", "command:interp_write_dynamic",
+    "command:deny_path",
+    # v0.4.33：interp_write_dynamic 移出豁免——它只对 `python -c` 内联代码
+    # 生效（脚本文件已不触发），用户按 [a]lways 应能记住该模式
 )
 
 

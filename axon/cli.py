@@ -455,8 +455,13 @@ class StatusLine:
         live = None
         try:
             from rich.live import Live
+            # v0.4.33：**关闭自动刷新**（auto_refresh=False）——旧实现 8Hz
+            # 自动重绘 Panel，插嘴编辑期间会把独立输入行冲掉/推走（截图：
+            # `⌨ 插嘴>  ⌨ 插嘴>` 重复行）。注意 rich 15 的
+            # refresh_per_second 断言必须 > 0，不能用 None 关闭。
+            # 现在只由 `_scroll_redraw()`（思考增量时）手动 refresh。
             live = Live(self._render_panel(), console=self.console,
-                        refresh_per_second=8, transient=False)
+                        auto_refresh=False, transient=False)
             live.__enter__()          # 手动管理生命周期（跨多次 write 调用）
         except Exception:             # noqa: BLE001
             live = None

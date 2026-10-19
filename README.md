@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/gufengaoyue/axon"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-gufengaoyue%2Faxon-181717?logo=github"></a>
   <a href="https://pypi.org/project/ai-agent-axon/"><img alt="PyPI" src="https://img.shields.io/badge/PyPI-ai--agent--axon-3775A9?logo=pypi&logoColor=white"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.4.32-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.33-blue">
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">

@@ -423,6 +423,13 @@ def analyze(cmd: str, workspace) -> CmdAnalysis:
                 # v0.4.29 P0：提取代码内的写路径（旧实现不提 → 任意位置可写）
                 code = _interp_code(prog, args, base, workspace) or ""
                 saw_w, wpaths, wdyn = _interp_write_info(code, base, workspace)
+                # v0.4.33：**只有内联代码（-c/-e）**才把"无法静态判定"升格为
+                # 审批。脚本文件（python x.py）是可审计的常规执行——脚本里的
+                # 变量路径无法静态判定属于正常写法，旧实现导致"每次跑脚本都
+                # 弹 interp_write_dynamic"（用户截图实测：dl.py/dl2.py 连续被问，
+                # 且该规则在缓存豁免名单里 → [a]lways 无效）
+                if not _interp_is_inline(args):
+                    wdyn = False
                 a.interp_only_write = saw_w
                 a.interp_write_dynamic = wdyn
                 a.paths.extend(wpaths)
@@ -553,6 +560,16 @@ def _classify_atom(prog: str, args: list[str], base: Path | None = None,
             return "file_write"             # 文件级变更（信任区内放行）
         return "read_only"                  # 计算/打印/读/网络请求 → 放行
     return "unknown"
+
+
+def _interp_is_inline(args: list[str]) -> bool:
+    """v0.4.33：是否为内联代码执行（-c/-e/--eval/-Command）。
+
+    内联代码没有可审计的文件载体 → 动态目标要 fail-closed 审批；
+    脚本文件（python x.py）走常规放行（脚本内容本身可被 read/edit 审计）。
+    """
+    flags = {"-c", "-e", "--eval", "-command"}
+    return any(str(a).lower() in flags for a in args)
 
 
 def _interp_code(prog: str, args: list[str], base: Path | None,

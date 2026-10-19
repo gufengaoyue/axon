@@ -358,7 +358,9 @@ class AgentLoop:
                     for ij in interject.take_all():
                         self.store.append_message(session.id, Message(
                             role="user", content=_wrap_ij(ij)))
-                        self.status.note("💬 插嘴已送达，智能体重新规划中…")
+                        # v0.4.33：不再重复提示——提交时 CLI 已打"已提交
+                        # （将在下一个动作前生效）"，这里再打一条同一件事
+                        # 会让用户看到两条相邻提示（截图实测）
                 # ---- 组装（超 90% → 强制压缩后重组装） ----
                 history = self.store.load_messages(session.id)
                 try:
