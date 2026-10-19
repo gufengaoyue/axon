@@ -90,9 +90,10 @@ def test_prompt_stream_yields_interjection_mid_turn():
 def test_reader_submit_callback_fires():
     got: list = []
     reader = InterjectReader(on_submit=got.append)
+    reader.feed("\r")                    # v0.4.31：Enter 唤起编辑态
     for ch in "你好":
         reader.feed(ch)
-    reader.feed("\r")
+    reader.feed("\r")                    # Enter 确认
     assert got == ["你好"]
     assert reader.current_input() == ""
 

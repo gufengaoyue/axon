@@ -26,9 +26,17 @@ def _reader_enabled() -> InterjectReader:
     return r
 
 
-def _type(reader: InterjectReader, text: str) -> None:
+def _type(reader: InterjectReader, text: str, submit: bool = False) -> None:
+    """v0.4.31 模态输入：Enter 唤起编辑态 → 逐字符 → 可选 Enter 提交。"""
+    reader.feed("\r")                    # 唤起
     for ch in text:
         reader.feed(ch)
+    if submit:
+        reader.feed("\r")                # 确认
+
+
+def _submit(reader: InterjectReader, text: str) -> None:
+    _type(reader, text, submit=True)
 
 
 # ---- 采集 ----
@@ -37,6 +45,7 @@ def test_type_and_submit():
     r = _reader_enabled()
     _type(r, "先别做 PPT")
     assert r.current_input() == "先别做 PPT"
+    assert r.mode == "editing"          # 编辑态（未确认）
     assert not r.has_pending()          # 未回车 → 尚未提交
     r.feed("\r")
     assert r.has_pending()
@@ -50,32 +59,34 @@ def test_backspace_and_esc():
     _type(r, "abc")
     r.feed("\x08")                       # Backspace
     assert r.current_input() == "ab"
-    r.feed("\x1b")                       # Esc 清空
+    r.feed("\x1b")                       # Esc 取消 → 退出编辑态
     assert r.current_input() == ""
+    assert r.mode == "idle"
 
 
 def test_multiple_submissions_preserved():
     """执行中可多次插嘴 → 回合结束后合并呈现。"""
     r = _reader_enabled()
-    _type(r, "补充一")
-    r.feed("\r")
-    _type(r, "补充二")
-    r.feed("\r")
+    _submit(r, "补充一")
+    _submit(r, "补充二")
     assert r.pop_all() == "补充一\n补充二"
 
 
 def test_empty_submit_ignored():
     r = _reader_enabled()
-    r.feed("\r")
-    assert not r.has_pending()
+    r.feed("\r")                        # 唤起
+    r.feed("   ")                        # 空白
+    r.feed("\r")                        # 确认空白 = 取消
+    assert not r.has_pending() and r.mode == "idle"
 
 
 def test_control_keys_not_swallowed_as_text():
     r = _reader_enabled()
     _type(r, "x")
     r.feed("\x03")                       # Ctrl+C：交给主线程（瞬断语义不变）
-    r.feed("\t")
-    assert r.current_input() == "x\t" or r.current_input() == "x"   # 控制符不进文本
+    r.feed("\t")                         # v0.4.31：制表符忽略（单行输入）
+    r.feed("\x00"); r.feed("H")          # 扩展键前缀 → 吞掉第二字节
+    assert r.current_input() == "x"
     assert "1" not in r.current_input()
 
 
@@ -88,14 +99,12 @@ def test_disabled_when_not_tty(monkeypatch):
     assert r._thread is None
 
 
-class _FakeStatus:
-    """验证状态行渲染包含插嘴回显。"""
-
-
 def test_status_line_renders_interjection(monkeypatch, capsys):
+    """v0.4.31：状态行只留轻提示，编辑内容走独占输入行。"""
+    import io
+    import sys as _s
     from axon.cli import StatusLine
     r = _reader_enabled()
-    _type(r, "改用 PDF 输出")
     sl = StatusLine(console=None)
     sl.keyboard = r
     sl._tty = True
@@ -106,7 +115,23 @@ def test_status_line_renders_interjection(monkeypatch, capsys):
     _t.sleep(0.25)
     sl._stop()
     out = capsys.readouterr().out
-    assert "插嘴" in out and "改用 PDF 输出" in out
+    assert "回车插嘴" in out
+
+    # 模态输入行：Enter 唤起 → 打字回显 → Enter 提交后清行
+    buf = io.StringIO()
+    old = _s.stdout
+    _s.stdout = buf
+    try:
+        r.on_mode_change = lambda m: (sl.begin_interject_input() if m == "editing"
+                                      else sl.end_interject_input())
+        r.on_render = sl.update_interject_input
+        _type(r, "改用 PDF 输出")
+        out2 = buf.getvalue()
+    finally:
+        _s.stdout = old
+        r.on_mode_change = None
+        r.on_render = None
+    assert "⌨ 插嘴> " in out2 and "改用 PDF 输出" in out2
 
 
 # ---- 注入 ----
@@ -122,8 +147,7 @@ def test_settle_confirm_injects_new_turn(monkeypatch):
     """确认后应以 <user_interjection> 起新一轮。"""
     from axon import cli as climod
     r = _reader_enabled()
-    _type(r, "加一页总结")
-    r.feed("\r")
+    _submit(r, "加一页总结")
     calls: list[str] = []
 
     def fake_run_turn(app, session, text, on_stuck):
@@ -142,8 +166,7 @@ def test_settle_confirm_injects_new_turn(monkeypatch):
 def test_settle_discard_on_no(monkeypatch):
     from axon import cli as climod
     r = _reader_enabled()
-    _type(r, "算了别做了")
-    r.feed("\r")
+    _submit(r, "算了别做了")
     calls: list[str] = []
     monkeypatch.setattr(climod, "_run_turn",
                         lambda *a, **k: calls.append(a[2]) or None)

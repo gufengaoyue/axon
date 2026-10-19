@@ -18,12 +18,31 @@ _MAX_LEN = 2000
 
 
 class InterjectReader:
-    """执行期间的键盘采集器（非 TTY 或平台不支持时自动禁用）。"""
+    """执行期间的键盘采集器（非 TTY 或平台不支持时自动禁用）。
+
+    v0.4.31 模态输入（用户需求）：旧实现"任何可打印字符都进 buffer、回车即提交"
+    ——思考期间没有入口、入口随渲染重启消失、且容易误把正常输入当插嘴。
+
+    新语义（两阶段）：
+      IDLE    —— 只监听 Enter（唤起插嘴输入），其余按键**丢弃**；
+      EDITING —— 字符入 buffer；Enter 提交（空白=取消）；Esc 取消；
+                 Backspace 删除；扩展键（方向键等）吞掉。
+
+    渲染解耦：`on_mode_change(mode)` / `on_render(text)` 由 CLI 注入，
+    键盘线程在状态变化时同步调用（渲染层自行加锁）。
+    """
+
+    IDLE = "idle"
+    EDITING = "editing"
 
     def __init__(self, on_submit=None):
         self.buffer: list[str] = []          # 正在输入的内容（供状态行回显）
         self.queue: list[str] = []           # 已提交、待确认的插嘴
         self.on_submit = on_submit           # 提交回调（CLI 用来即时提示，v0.3.0）
+        self.on_mode_change = None           # v0.4.31：mode 进出回调（渲染层用）
+        self.on_render = None                # v0.4.31：编辑内容变化回调（重绘输入行）
+        self._mode = self.IDLE
+        self._ext_key = False                # 扩展键第二字节待吞（\x00/\xe0 前缀）
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._enabled = bool(getattr(sys.stdin, "isatty", lambda: False)())
@@ -44,9 +63,21 @@ class InterjectReader:
     def enabled(self) -> bool:
         return self._enabled
 
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def is_editing(self) -> bool:
+        return self._mode == self.EDITING
+
     def start(self) -> None:
         if not self._enabled or self._thread is not None:
             return
+        # 新回合从干净状态开始（上回合未提交的残留不续写）
+        with self._lock:
+            self.buffer.clear()
+            self._mode = self.IDLE
+            self._ext_key = False
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="axon-interject")
@@ -57,6 +88,11 @@ class InterjectReader:
         t, self._thread = self._thread, None
         if t is not None:
             t.join(timeout=0.5)     # v0.4.29：等待线程真正退出（防 stop→start 并行 poll）
+        # v0.4.31：退出编辑态但不回调渲染（终端即将由 status.idle() 收尾）；
+        # **保留 buffer**——_run_turn 的 finally 要提示"未提交的插嘴"
+        with self._lock:
+            self._mode = self.IDLE
+            self._ext_key = False
 
     # ---- 采集循环 ----
     def _loop(self) -> None:
@@ -89,36 +125,85 @@ class InterjectReader:
 
     # ---- 字符处理（可单测，无需真实键盘） ----
     def feed(self, ch: str) -> None:
+        """按键分发（v0.4.31 模态语义）。
+
+        IDLE：Enter 唤起输入（进入 EDITING），其余按键丢弃。
+        EDITING：Enter 提交（空白=取消）/ Esc 取消 / Backspace / 可打印字符。
+        """
+        enter = ch in ("\r", "\n")
+        esc = ch == "\x1b"
         with self._lock:
-            if ch in ("\r", "\n"):
-                text = "".join(self.buffer).strip()
-                self.buffer.clear()
-                if text:
-                    # v0.4.29：单一数据流——有 on_submit（CLI）时全走 bridge
-                    # （fallback 保证不丢）；旧实现同时 append queue + 走
-                    # bridge → openai 路轮次边界注入后，_settle 又看到
-                    # reader.queue 残留 → 同一插嘴被注入/确认两次
-                    if self.on_submit is not None:
-                        try:
-                            self.on_submit(text[:_MAX_LEN])
-                        except Exception:
-                            # v0.4.30：回调异常不得静默丢——回退队列由
-                            # _settle_interjections 兜底
-                            self.queue.append(text[:_MAX_LEN])
+            # 扩展键前缀（方向键/Insert/Home… 产生 \x00 或 \xe0 + 第二字节）：
+            # 吞掉第二字节，避免把 'H'/'P' 之类当正文
+            if self._ext_key:
+                self._ext_key = False
+                return
+            if ch in ("\x00", "\xe0"):
+                self._ext_key = True
+                return
+
+            if self._mode == self.IDLE:
+                if enter:
+                    self._mode = self.EDITING
+                    self._ext_key = False
+                    _notify = ("editing", "")
+                else:
+                    return               # IDLE 下不采集正文（防误输入）
+            else:                        # EDITING
+                if enter:
+                    text = "".join(self.buffer).strip()
+                    self.buffer.clear()
+                    self._mode = self.IDLE
+                    _submit = text or None       # 空白 → None（视为取消）
+                    _notify = ("idle", text)
+                elif esc:
+                    self.buffer.clear()
+                    self._mode = self.IDLE
+                    _submit = None
+                    _notify = ("idle", "")
+                elif ch == "\x08":               # Backspace
+                    if self.buffer:
+                        self.buffer.pop()
+                        _notify = ("render", "".join(self.buffer))
                     else:
-                        self.queue.append(text[:_MAX_LEN])
-                return
-            if ch == "\x08":                     # Backspace
-                if self.buffer:
-                    self.buffer.pop()
-                return
-            if ch == "\x1b":                     # Esc → 清空
-                self.buffer.clear()
-                return
-            if ch == "\x03":                     # Ctrl+C 交给主线程（瞬断语义不变）
-                return
-            if ch.isprintable():
-                self.buffer.append(ch)
+                        return
+                elif ch == "\x03":               # Ctrl+C 交给主线程（瞬断语义不变）
+                    return
+                elif ch == "\t":
+                    return                       # 制表符忽略（单行输入）
+                elif ch.isprintable():
+                    if len("".join(self.buffer)) < _MAX_LEN:
+                        self.buffer.append(ch)
+                    _notify = ("render", "".join(self.buffer))
+                else:
+                    return
+
+        # 出锁后再调外部回调（渲染会写 stdout，持锁调用易放大阻塞）
+        if _notify[0] == "render":
+            cb = self.on_render
+            if cb is not None:
+                try:
+                    cb(_notify[1])
+                except Exception:                # noqa: BLE001
+                    pass
+            return
+        # 模式切换：先退出编辑态（渲染层清输入行、恢复转圈），再提交
+        cb = self.on_mode_change
+        if cb is not None:
+            try:
+                cb(_notify[0])
+            except Exception:                    # noqa: BLE001
+                pass
+        if _notify[0] == "idle" and _submit:
+            if self.on_submit is not None:
+                try:
+                    self.on_submit(_submit)
+                except Exception:
+                    # v0.4.30：回调异常不得静默丢——回退队列由
+                    # _settle_interjections 兜底
+                    self.queue.append(_submit)
+            else:
+                self.queue.append(_submit)
 
     # ---- 待确认队列 ----
     def has_pending(self) -> bool:

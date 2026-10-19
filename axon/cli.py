@@ -143,6 +143,10 @@ class StatusLine:
         self._two_line = False         # 双行模式：状态行 + 常驻输入行（v0.2.9）
         self._ctl_lock = threading.Lock()   # v0.4.29：_start/_stop 跨线程互斥
         self._render_paused = False     # v0.4.29：打印窗口期暂停渲染（防粘连）
+        # v0.4.31：插嘴模态输入行
+        self._interject_editing = False
+        self._interject_text = ""
+        self._ij_len = 0                # 输入行已渲染列宽（擦尾用）
 
     # ---- 内部 ----
     def _input_line(self) -> str:
@@ -198,12 +202,10 @@ class StatusLine:
                 pass
             return status + "\n" + self._input_line()
         tail = ""
+        # v0.4.31：编辑态时 spinner 不渲染（_render_paused），这里只留"如何插嘴"的
+        # 常驻轻提示——编辑内容由独占输入行显示（与思考/执行内容隔离）
         if self.keyboard is not None:
-            cur = self.keyboard.current_input()
-            if cur:
-                # v0.4.28：单行模式沿用双行的"← 按回车发送"提示（v0.4.23
-                # 修复"插不进嘴"的核心提示，不因默认关双行而丢失）
-                tail = f"   ⌨ 插嘴: {cur[-48:]}  ← 按回车发送"
+            tail = "   ⌨ 回车插嘴"
         self._write(f"{status}{tail}")
         return f"{status}{tail}"
 
@@ -436,8 +438,14 @@ class StatusLine:
         pending = getattr(self, "_pending_echo", None)
         if pending:
             body.append("\n" + pending[-1][0], style=pending[-1][1])
+        # v0.4.31：插嘴编辑中（Live 独占终端）→ 输入行并入面板
+        _extra = 0
+        if getattr(self, "_interject_editing", False):
+            body.append("\n" + self._interject_line(), style="bold cyan")
+            _extra = 1
         return Panel(body, title="💭 深度思考", title_align="left",
-                     border_style="dim", height=self.SCROLL_N + 2, padding=(0, 1))
+                     border_style="dim", height=self.SCROLL_N + 2 + _extra,
+                     padding=(0, 1))
 
     def _thinking_begin(self) -> None:
         """打开思考滚动框（rich Live，原地刷新，跨平台可靠）。"""
@@ -497,6 +505,19 @@ class StatusLine:
             self._scroll_lines = []
             self._scroll_buf = ""
             self.pending_line = False
+            # v0.4.31：Live 关闭后若仍在插嘴编辑态 → 重建**独立**输入行
+            # （此前输入行是并入 Panel 的；Panel 关掉后它会消失，后续按键
+            # 重绘会落到错误行）。有 pending_echo 时 `_print` 已顺带重绘过。
+            if (getattr(self, "_interject_editing", False) and self._tty
+                    and not getattr(self, "_live_active", False) and not pending):
+                self._pause_render()
+                try:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                except (ValueError, OSError):
+                    pass
+                self._ij_len = 0
+                self._draw_interject_line()
         self._think_shown = 0            # 兼容旧计数（v0.4.16）
         self._think_hidden = 0
         self._think_capped_noted = False
@@ -663,16 +684,104 @@ class StatusLine:
         v0.3.0 要求"工具成功后转圈继续"（长任务中途不能无动效），但旧实现
         直接 console.print → ✓ 行与 spinner 帧粘连成擦不掉的残影。暂停窗口
         极短（一次 print），线程保持存活，动效不受影响。
+
+        v0.4.31：插嘴编辑态下**打印到输入行上方**——先清输入行 → 打印 →
+        重绘输入行（用户在打字时工具结果照常可见，输入不丢、焦点不散）。
         """
+        if self._interject_editing and not getattr(self, "_live_active", False):
+            # 编辑态已处于 render_paused（spinner 帧不写）→ 不重复 pause/resume
+            self._clear_interject_line()
+            try:
+                self._print_raw(text, style)
+            finally:
+                self._draw_interject_line()
+            return
         self._pause_render()
         try:
-            if self.console is not None:
-                self.console.print(text, markup=False, highlight=False, style=style)
-            else:
-                sys.stdout.write(text + "\n")
-                sys.stdout.flush()
+            self._print_raw(text, style)
         finally:
             self._resume_render()
+
+    def _print_raw(self, text: str, style: str = "") -> None:
+        if self.console is not None:
+            self.console.print(text, markup=False, highlight=False, style=style)
+        else:
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+
+    # ---- 插嘴模态输入行（v0.4.31，用户需求）----
+
+    def begin_interject_input(self) -> None:
+        """进入插嘴编辑态：暂停转圈（Live 期间改为并入 Panel 底部）。"""
+        self._interject_editing = True
+        self._interject_text = ""
+        if getattr(self, "_live_active", False) and getattr(self, "_live", None):
+            # Live 独占终端：输入行并入 Panel（裸 ANSI 会被 Live 覆盖）
+            self._scroll_redraw()
+            return
+        self._pause_render()                 # 停帧 + 清状态行
+        try:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        except (ValueError, OSError):
+            pass
+        self._ij_len = 0
+        self._draw_interject_line()
+
+    def update_interject_input(self, text: str) -> None:
+        """编辑内容变化 → 重绘输入行（键盘线程调用，内部加锁）。"""
+        self._interject_text = text or ""
+        if getattr(self, "_live_active", False):
+            self._scroll_redraw()
+            return
+        with self._ctl_lock:
+            self._draw_interject_line()
+
+    def end_interject_input(self) -> None:
+        """退出编辑态：清输入行 → 恢复转圈（Live 期间只清 Panel 尾部）。"""
+        self._interject_editing = False
+        self._interject_text = ""
+        if getattr(self, "_live_active", False):
+            self._scroll_redraw()
+            return
+        with self._ctl_lock:
+            try:
+                if self._ij_len:
+                    sys.stdout.write("\r" + " " * self._ij_len + "\r")
+                    sys.stdout.flush()
+                self._ij_len = 0
+            except (ValueError, OSError):
+                pass
+            self._render_paused = False      # 恢复转圈
+
+    @staticmethod
+    def _display_width(s: str) -> int:
+        import unicodedata
+        return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                   for c in s)
+
+    def _interject_line(self) -> str:
+        return f"⌨ 插嘴> {self._interject_text}"
+
+    def _draw_interject_line(self) -> None:
+        """在当前行重绘输入行（含擦尾），光标停在行尾。"""
+        line = self._interject_line()
+        try:
+            pad = max(0, self._ij_len - self._display_width(line))
+            sys.stdout.write("\r" + line + " " * pad + "\r" + line)
+            sys.stdout.flush()
+            self._ij_len = self._display_width(line)
+        except (ValueError, OSError):
+            pass
+
+    def _clear_interject_line(self) -> None:
+        try:
+            if self._ij_len:
+                sys.stdout.write("\r" + " " * self._ij_len + "\r")
+                sys.stdout.flush()
+            self._ij_len = 0
+        except (ValueError, OSError):
+            pass
 
     def _pause_render(self) -> None:
         """暂停 spinner 渲染并清空状态区（v0.4.29）。"""
@@ -960,6 +1069,15 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
     st._think_note_shown = False        # v0.4.28：思考存档提示每回合一次
     if kb is not None and kb.enabled and kb._thread is None:
         kb.start()
+    # v0.4.31：插嘴模态输入接线（只在回合执行期生效；IDLE 时不采集正文）
+    if kb is not None:
+        def _ij_mode(mode: str) -> None:
+            if mode == "editing":
+                st.begin_interject_input()
+            else:
+                st.end_interject_input()
+        kb.on_mode_change = _ij_mode
+        kb.on_render = st.update_interject_input
     app["loop"].status.start_watchdog()      # v0.4.5：静默期自动转圈
     show_thinking = bool(getattr(app["cfg"].agent, "show_thinking", True))
     # v0.4.29 P1：插嘴桥**直接下传**不再在此 bind——同步线程里没有运行中的
@@ -989,6 +1107,9 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
         st._stop()
         if kb is not None:
             kb.stop()
+        # v0.4.31：回合结束时仍在编辑态 → 清输入行（未提交内容由下方提示兜底）
+        if getattr(st, "_interject_editing", False):
+            st.end_interject_input()
         left = kb.current_input() if kb is not None else ""
         if left:                       # v0.3.0：未提交的插嘴不再"凭空消失"
             if console is not None:
@@ -2240,9 +2361,10 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             return
         if console is not None:
-            console.print(msg, style="green", markup=False)
+            # v0.4.31：走 _print（内部暂停转圈+清状态行），避免与 spinner 帧粘连
+            status._print(msg, style="green")
             if warn:
-                console.print(warn, style="yellow", markup=False)
+                status._print(warn, style="yellow")
         else:  # pragma: no cover
             print(msg)
             if warn:

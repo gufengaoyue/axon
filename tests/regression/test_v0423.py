@@ -26,6 +26,7 @@ def _sl():
 
 def test_input_line_hints_enter_when_typing():
     sl = _sl()
+    sl.keyboard.feed("\r")               # v0.4.31：Enter 唤起编辑态
     for ch in "改成竖版":
         sl.keyboard.feed(ch)
     line = sl._input_line()

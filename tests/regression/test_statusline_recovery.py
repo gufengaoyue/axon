@@ -10,6 +10,7 @@ def _reader_with(text: str):
     from axon.interject import InterjectReader
     r = InterjectReader()
     r._enabled = True
+    r.feed("\r")                        # v0.4.31：Enter 唤起编辑态
     for ch in text:
         r.feed(ch)
     return r
@@ -76,7 +77,11 @@ def test_two_line_render_keeps_prompt_visible(capsys):
 
 
 def test_single_line_fallback(capsys):
-    """VT 不可用 → 单行回退：插嘴挂在状态行尾。"""
+    """VT 不可用 → 单行回退：状态行尾部只留"回车插嘴"轻提示。
+
+    v0.4.31：编辑内容不再挂在状态行（会随每帧重绘闪烁/丢失焦点），
+    改由 `begin_interject_input()` 的独占输入行显示。
+    """
     from axon.cli import StatusLine
     sl = StatusLine(console=None)
     sl._tty = True
@@ -84,7 +89,11 @@ def test_single_line_fallback(capsys):
     sl._two_line = False
     sl._notes = ["思考中"]
     rendered = sl._render_once(0, el=3.0)
-    assert "思考中 (3s)" in rendered and "插嘴" in rendered and "补充" in rendered
+    assert "思考中 (3s)" in rendered and "回车插嘴" in rendered
+    # 编辑内容走独占行
+    sl._interject_editing = True
+    sl._interject_text = sl.keyboard.current_input()
+    assert "补充" in sl._interject_line()
 
 
 # ---- 会话生命周期 / 异常结束补沉淀 ----

@@ -102,13 +102,17 @@ def test_tool_result_success_keeps_spinner(rich_sl):
 
 
 def test_interject_tail_has_enter_hint_in_single_line(rich_sl):
-    """单行模式的插嘴尾缀保留 v0.4.23 的"← 按回车发送"提示。"""
+    """单行模式的插嘴尾缀（v0.4.31 起为"回车插嘴"）。
+
+    v0.4.23 的"← 按回车发送"随内容显示，但内容每帧重绘 → 闪烁/失焦；
+    v0.4.31 改为模态输入：状态行只留"回车插嘴"唤起提示，编辑内容走独占输入行。
+    """
     class _KB:
         def current_input(self):
             return "补充内容"
     rich_sl.keyboard = _KB()
     frame = rich_sl._render_once(0)
-    assert "按回车发送" in frame
+    assert "回车插嘴" in frame
 
 
 # ============================================================ ② 思考存档 + /think
