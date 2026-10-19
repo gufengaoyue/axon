@@ -8,8 +8,9 @@
 新语义（用户拍板）：
   - 执行期（含思考）按 **Enter** 唤起 `⌨ 插嘴> ` 独占输入行（与思考/执行隔离）；
   - 输入中 **Enter** 确认提交；**空白**确认视为取消；**Esc** 取消；
-  - 编辑期间工具结果照常**打印到输入行上方**，输入不丢、焦点不散；
-  - 思考 Live 期间输入行**并入 Panel 底部**（Live 独占终端，裸 ANSI 会被覆盖）。
+  - 编辑期间工具结果照常**打印到输入行上方**（Live 活跃时改为排队，退出编辑后补打）；
+  - 思考 Live 期间 Panel **冻结不刷新**，输入行始终是**独立行**（v0.4.32：
+    并入 Panel 会在 Panel 定格式时留下幽灵行，用户截图实测）。
 """
 from __future__ import annotations
 
@@ -177,17 +178,86 @@ def test_print_goes_above_input_line():
     assert "⌨ 插嘴> 正在打字" in tail
 
 
-def test_render_panel_embeds_input_line_when_live():
-    """Live（思考框）期间输入行并入 Panel，且高度 +1。"""
+def test_render_panel_does_not_embed_input_line_when_live():
+    """v0.4.32：输入行**不**并入 Panel。
+
+    旧实现把输入行追加到 Panel body——Panel 是非 transient 的，关闭时内容
+    定格 → 输入行永久留在屏幕（用户截图实测的幽灵行）。
+    """
     from axon.cli import StatusLine
     sl = StatusLine(console=None)
     sl._scroll_lines = ["思考中…"]
     sl._interject_editing = True
     sl._interject_text = "边想边补"
     panel = sl._render_panel()
-    assert panel.height == sl.SCROLL_N + 2 + 1
-    # 面板 body 含输入行文本
-    assert "⌨ 插嘴> 边想边补" in str(panel.renderable)
+    assert panel.height == sl.SCROLL_N + 2
+    assert "⌨ 插嘴> 边想边补" not in str(panel.renderable)
+
+
+def test_live_print_is_deferred_and_does_not_resume_spinner():
+    """v0.4.32 回归：Live + 编辑态打印必须排队，且不得重置 `_render_paused`。
+
+    旧实现条件 `_interject_editing and not _live_active` → Live 期间的打印
+    走普通分支，`finally: _resume_render()` 把 paused 置 False → spinner
+    恢复写帧，与输入行抢同一行（用户截图：状态行尾部拼着输入内容）。
+    """
+    import io
+    import sys as _s
+    from axon.cli import StatusLine
+    sl = StatusLine(console=None)
+    sl._tty = True
+    sl._running = True
+    sl._live_active = True
+    buf = io.StringIO()
+    old = _s.stdout
+    _s.stdout = buf
+    try:
+        sl.begin_interject_input()
+        sl._print("✓ 完成 · x")
+        phase1 = buf.getvalue()
+        paused, n_deferred = sl._render_paused, len(sl._deferred)
+        sl.end_interject_input()
+        pending = list(sl._pending_echo or [])
+    finally:
+        _s.stdout = old
+    assert "✓ 完成" not in phase1          # 编辑期间不上屏
+    assert paused is True and n_deferred == 1
+    assert any("✓ 完成" in m for m, _ in pending)   # 转面板队列，关闭时补打
+
+
+def test_live_editing_shows_independent_input_line():
+    """v0.4.32：Live 期间输入行仍是独立行（旧实现走冻结的 redraw → 不回显）。"""
+    import io
+    import sys as _s
+    from axon.cli import StatusLine
+    sl = StatusLine(console=None)
+    sl._tty = True
+    sl._live_active = True
+    buf = io.StringIO()
+    old = _s.stdout
+    _s.stdout = buf
+    try:
+        sl.begin_interject_input()
+        sl.update_interject_input("思考中补充")
+        out = buf.getvalue()
+    finally:
+        _s.stdout = old
+    assert "⌨ 插嘴> 思考中补充" in out
+
+
+def test_scroll_redraw_frozen_while_editing():
+    """编辑期间 Panel 不刷新（防覆盖输入行）。"""
+    from axon.cli import StatusLine
+    sl = StatusLine(console=None)
+    calls = []
+
+    class _Live:
+        def update(self, *a, **k):
+            calls.append(1)
+    sl._live = _Live()
+    sl._interject_editing = True
+    sl._scroll_redraw()
+    assert calls == []
 
 
 def test_status_line_hint_mentions_enter():

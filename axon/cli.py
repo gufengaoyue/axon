@@ -147,6 +147,7 @@ class StatusLine:
         self._interject_editing = False
         self._interject_text = ""
         self._ij_len = 0                # 输入行已渲染列宽（擦尾用）
+        self._deferred: list = []       # v0.4.32：编辑期间无法上屏的输出（Live 用）
 
     # ---- 内部 ----
     def _input_line(self) -> str:
@@ -438,13 +439,11 @@ class StatusLine:
         pending = getattr(self, "_pending_echo", None)
         if pending:
             body.append("\n" + pending[-1][0], style=pending[-1][1])
-        # v0.4.31：插嘴编辑中（Live 独占终端）→ 输入行并入面板
-        _extra = 0
-        if getattr(self, "_interject_editing", False):
-            body.append("\n" + self._interject_line(), style="bold cyan")
-            _extra = 1
+        # v0.4.32：**不再**把插嘴输入行并入 Panel——Panel 是非 transient 的，
+        # 关闭时内容定格 → 输入行会永久留在屏幕（用户截图实测的幽灵行）。
+        # 编辑期间 Panel 冻结不刷新，输入行由独立行持有。
         return Panel(body, title="💭 深度思考", title_align="left",
-                     border_style="dim", height=self.SCROLL_N + 2 + _extra,
+                     border_style="dim", height=self.SCROLL_N + 2,
                      padding=(0, 1))
 
     def _thinking_begin(self) -> None:
@@ -470,7 +469,13 @@ class StatusLine:
         self.pending_line = False
 
     def _scroll_redraw(self, force: bool = False) -> None:
-        """刷新滚动窗口（rich Live 负责光标与重绘）。"""
+        """刷新滚动窗口（rich Live 负责光标与重绘）。
+
+        v0.4.32：插嘴编辑期间**冻结** Panel——Live 重绘会覆盖独立输入行
+        （或在 Panel 内复制一份），思考增量只累积不上屏。
+        """
+        if getattr(self, "_interject_editing", False):
+            return
         live = getattr(self, "_live", None)
         if live is None:
             return
@@ -688,8 +693,15 @@ class StatusLine:
         v0.4.31：插嘴编辑态下**打印到输入行上方**——先清输入行 → 打印 →
         重绘输入行（用户在打字时工具结果照常可见，输入不丢、焦点不散）。
         """
-        if self._interject_editing and not getattr(self, "_live_active", False):
-            # 编辑态已处于 render_paused（spinner 帧不写）→ 不重复 pause/resume
+        if self._interject_editing:
+            # v0.4.32：编辑态**绝不**走普通分支——旧实现条件带 `not _live_active`，
+            # Live 期间的打印会走普通分支并在 finally 把 `_render_paused` 置 False
+            # → spinner 恢复写帧，与输入行抢同一行（用户截图实测的错位行）。
+            if getattr(self, "_live_active", False):
+                # Live 独占区域：无法把输出插到输入行上方 → 排队，退出编辑后补打
+                self._deferred.append((text, style))
+                return
+            # 非 Live：输入行就是最后一行 → 清行 → 打印（落在输入行上方）→ 重绘
             self._clear_interject_line()
             try:
                 self._print_raw(text, style)
@@ -715,11 +727,11 @@ class StatusLine:
         """进入插嘴编辑态：暂停转圈（Live 期间改为并入 Panel 底部）。"""
         self._interject_editing = True
         self._interject_text = ""
-        if getattr(self, "_live_active", False) and getattr(self, "_live", None):
-            # Live 独占终端：输入行并入 Panel（裸 ANSI 会被 Live 覆盖）
-            self._scroll_redraw()
-            return
-        self._pause_render()                 # 停帧 + 清状态行
+        self._deferred = []
+        # v0.4.32：Live 与普通态**统一**写独立输入行——Panel 在编辑期间冻结
+        # 不刷新（`_scroll_redraw` 早退），所以输入行写在 Panel 下方不会被覆盖；
+        # 也不再往 Panel 里塞第二份（Panel 定格会造成幽灵行）
+        self._pause_render()                 # 停帧 + 清状态行（Live 时仅置标志）
         try:
             sys.stdout.write("\n")
             sys.stdout.flush()
@@ -729,11 +741,13 @@ class StatusLine:
         self._draw_interject_line()
 
     def update_interject_input(self, text: str) -> None:
-        """编辑内容变化 → 重绘输入行（键盘线程调用，内部加锁）。"""
+        """编辑内容变化 → 重绘输入行（键盘线程调用，内部加锁）。
+
+        v0.4.32：Live 与普通态统一重绘**独立**输入行——旧实现 Live 分支调
+        `_scroll_redraw()`，而该函数在编辑态已冻结（早退）→ 思考期间打字
+        完全不回显（用户截图的"看不到输入"）。
+        """
         self._interject_text = text or ""
-        if getattr(self, "_live_active", False):
-            self._scroll_redraw()
-            return
         with self._ctl_lock:
             self._draw_interject_line()
 
@@ -741,7 +755,12 @@ class StatusLine:
         """退出编辑态：清输入行 → 恢复转圈（Live 期间只清 Panel 尾部）。"""
         self._interject_editing = False
         self._interject_text = ""
+        deferred, self._deferred = self._deferred, []
         if getattr(self, "_live_active", False):
+            # 仍在 Live：延迟输出转交面板底部队列（Panel 关闭时补打）
+            for text, style in deferred:
+                self._pending_echo = (getattr(self, "_pending_echo", None)
+                                      or []) + [(text, style)]
             self._scroll_redraw()
             return
         with self._ctl_lock:
@@ -753,6 +772,8 @@ class StatusLine:
             except (ValueError, OSError):
                 pass
             self._render_paused = False      # 恢复转圈
+        for text, style in deferred:          # v0.4.32：补打编辑期间排队的输出
+            self._print_raw(text, style)
 
     @staticmethod
     def _display_width(s: str) -> int:
