@@ -28,8 +28,29 @@ def make_spec(ctx: ToolContext) -> ToolSpec:
             return tool_result_err(call, "model", f"文件不存在: {path}")
         if old == new:
             return tool_result_err(call, "model", "old_string 与 new_string 相同，无需修改")
-        text = path.read_text(encoding="utf-8", errors="replace")
-        n = text.count(old)
+        # v0.4.29 P1：字节域操作——旧实现 read_text(errors="replace") 把非
+        # UTF-8（GBK 等）文件的非法字节变成 U+FFFD，再以 UTF-8 写回 → 原字节
+        # 永久丢失（用户无感知，快照可恢复但仍是数据破坏）。现在按字节匹配
+        # 替换，文件其余部分（含其他编码字节）原样保留。
+        try:
+            raw = path.read_bytes()
+        except OSError as e:
+            return tool_result_err(call, "resource", f"读取失败: {e}")
+        old_b = old.encode("utf-8")
+        new_b = new.encode("utf-8")
+        n = raw.count(old_b)
+        # v0.4.30：换行域对齐——write_file 在 Windows 落盘为 CRLF，read_file
+        # 以 universal newlines 显示为 LF；模型用 LF 的 old_string 在字节域
+        # 必然不匹配（"自写→自读→自改"闭环断裂）。0 命中时按 CRLF/LF 互换重试，
+        # 命中后 new_string 用同一风格生成。
+        if n == 0 and "\n" in old:
+            for src_nl, dst_nl in (("\n", "\r\n"), ("\r\n", "\n")):
+                alt = old.replace(src_nl, dst_nl).encode("utf-8")
+                if alt in raw:
+                    old_b = alt
+                    new_b = new.replace(src_nl, dst_nl).encode("utf-8")
+                    n = raw.count(old_b)
+                    break
         if n == 0:
             return tool_result_err(
                 call, "model",
@@ -40,12 +61,15 @@ def make_spec(ctx: ToolContext) -> ToolSpec:
                 call, "model",
                 f"old_string 在文件中出现 {n} 次，不满足唯一匹配；"
                 "请扩大 old_string 上下文范围使其唯一")
-        updated = text.replace(old, new, 1)
-        path.write_text(updated, encoding="utf-8")
+        updated = raw.replace(old_b, new_b, 1)
+        try:
+            path.write_bytes(updated)
+        except OSError as e:
+            return tool_result_err(call, "resource", f"写入失败: {e}")
         return tool_result_ok(
             call, f"已修改 {path}（替换 1 处）",
             meta={"path": str(path), "replaced": 1,
-                  "sha256": hashlib.sha256(updated.encode("utf-8")).hexdigest()[:16]})
+                  "sha256": hashlib.sha256(updated).hexdigest()[:16]})
 
     def to_action(args: dict) -> Action:
         return Action(kind="fs_edit", target=str(resolve_path(ctx, args["path"])),

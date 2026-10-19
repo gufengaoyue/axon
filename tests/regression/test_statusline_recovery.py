@@ -18,7 +18,13 @@ def _reader_with(text: str):
 # ---- 残影修复：写短行必须擦掉上一行长出的部分 ----
 
 def test_write_erases_previous_longer_line(capsys):
+    import unicodedata
     from axon.cli import StatusLine
+
+    def _w(s: str) -> int:
+        return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                   for c in s)
+
     sl = StatusLine(console=None)
     sl._tty = True
     sl._write("执行 execute_shell … (46s)")     # 长行
@@ -27,7 +33,8 @@ def test_write_erases_previous_longer_line(capsys):
     last = out.split("\r")[-1]
     assert last.startswith("等待执行结果… (47s)")
     assert last.endswith(" ")                    # 有擦除填充
-    assert len(last) >= len("执行 execute_shell … (46s)")
+    # v0.4.29：擦除按**终端列宽**计算（CJK 占 2 列）——旧断言按字符数
+    assert _w(last) >= _w("执行 execute_shell … (46s)")
 
 
 def test_write_same_length_no_padding(capsys):

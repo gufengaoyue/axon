@@ -317,6 +317,10 @@ class CodebuddyRunner:
         status.thinking()
 
         # ---- 多模态注入（v0.4.6）：原生 image block；失败则进程内降级 ----（见下）
+        # v0.4.29 P0：import 提到函数顶部——324 行引用时若还在 332 行才导入，
+        # `_vision` 是 cellvar（被嵌套函数引用）→ UnboundLocalError，codebuddy
+        # 路带图必崩（用户贴图场景）
+        from axon import vision as _vision
         prompt_input = user_input
         image_paths = list(images or [])
         if image_paths and getattr(self, "_native_image_blocked", False):
@@ -329,7 +333,6 @@ class CodebuddyRunner:
         # 中断当前回合 → 同 session 用 query(插嘴) 立即重发（下一个决策点生效）。
         # prompt 仍可走流式（仅用于图片多模态注入）。
         if use_image_stream:
-            from axon import vision as _vision
             if _vision.vision_available(self.config, session.model):
                 async def _prompt_stream():
                     content: list[dict] = [{"type": "text", "text": user_input}]
@@ -341,13 +344,21 @@ class CodebuddyRunner:
                            "message": {"role": "user", "content": content}}
                 prompt_input = _prompt_stream()
             else:
-                from axon import vision as _vision2
-                note = _vision2.build_vision_note(image_paths, self.config,
-                                                  session.model)
+                note = _vision.build_vision_note(image_paths, self.config,
+                                                 session.model)
                 prompt_input = user_input + (note or "")
 
         async def _drive() -> None:
             nonlocal tokens_used, sdk_session_id, error_msg
+            # v0.4.29 P1：插嘴桥在此 bind——这里才有运行中的事件循环
+            # （旧实现在同步的 _run_turn 里 bind，必失败 → interject=None →
+            # 执行中插嘴注入整体失效）。bind 后 _prompt_stream/消息边界的
+            # interject.get() 即可消费键盘线程投递的插嘴。
+            if interject is not None:
+                try:
+                    interject.bind(asyncio.get_running_loop())
+                except RuntimeError:
+                    pass
             # v0.4.16：改用 CodeBuddySDKClient（有状态客户端）——它暴露 interrupt()，
             # 支撑"插嘴到达 → 中断当前回合 → 同 session 立即重发"（下一个动作前生效）。
             # v0.4.18 修复（用户实测"159 秒无输出卡死"）：**不可**在 async with 之后再
@@ -416,7 +427,9 @@ class CodebuddyRunner:
                             if on_text:
                                 on_text(ev.text)
                         elif ev.kind == "thinking":
-                            self._pending_text += ev.text
+                            # v0.4.30：思考**不并入** _pending_text——旧实现把它
+                            # 作为 assistant content 落库，历史/进度日志/resume
+                            # 展示里推理与最终回答混在一起（"重复叙述"观感）
                             if on_thinking:
                                 on_thinking(ev.text)
                         elif ev.kind == "tool_call" and ev.tool_call is not None:
@@ -457,7 +470,7 @@ class CodebuddyRunner:
         if sdk_session_id:
             self.store.set_sdk_session_id(session.id, sdk_session_id)
         self._flush_pending_text(session)   # 尾部叙述（工具调用之后的收尾说明）
-        self._flush_pending_text(session)
+        # v0.4.29：删掉重复调用（第二次必然空操作）
 
         if error_msg:
             note = error_msg
@@ -469,7 +482,7 @@ class CodebuddyRunner:
             if image_paths and any(k in low for k in ("image", "content block",
                                                      "media_type", "unsupported")):
                 self._native_image_blocked = True       # 底层不支持图片 → 降级
-                note += ("\\n[提示] 本次原生图片注入被拒绝，已自动降级："
+                note += ("\n[提示] 本次原生图片注入被拒绝，已自动降级："
                          "下回合将改用视觉副模型描述（可配置 model.vision_helper）。")
             return TurnResult(final_text, "provider_error",
                               len(scope_turns) or 1, tokens_used,

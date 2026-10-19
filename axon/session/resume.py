@@ -12,8 +12,10 @@ from axon.session.db import Session, SessionStore
 
 
 # 系统内部消息（非用户真实请求）——不能当作"上次任务"
-_INTERNAL_MARKERS = ("<resume_context>", "<verification", "<tool_name_hint>",
-                     "请为本次会话沉淀", "沉淀「项目记忆」")
+_INTERNAL_MARKERS = (
+    "<user_interjection>", "<conversation_summary>",     # v0.4.30 补齐
+    "<resume_context>", "<verification", "<tool_name_hint>",
+    "请为本次会话沉淀", "沉淀「项目记忆」")
 
 
 def is_internal_message(text: str) -> bool:
@@ -87,7 +89,7 @@ def build_resume_message(session: Session, side_effects: list[dict],
         "<resume_context>",
         f"session: {session.id}",
         f"project: {session.project_dir}",
-        f"interrupted_at_turn: {session.updated_at}",
+        f"interrupted_at: {session.updated_at}",   # v0.4.29：原字段名 turn 但填的是时间戳
     ]
     if last_request:
         lines.append(f"last_user_request: {last_request[:400]}")

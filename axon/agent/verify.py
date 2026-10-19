@@ -138,23 +138,38 @@ class TurnVerifier:
             last_asst_turn = max((m.turn for m in messages if m.role == "assistant"),
                                  default=0)
             scope = {last_asst_turn}
+        elif scope_turns:
+            # v0.4.30：规则 2 是**统计口径**（本回合被拒次数），用全集；
+            # 不再取"最后一个 tool 轮"——那会跳过早期的被拒记录，
+            # "反复重试被拒动作"反而查不出来
+            scope = set(scope_turns)
         else:
-            # 本回合早期被拒、模型随后换方法成功的场景**不该判负**（旧 openai 路
-            # 口径=最后 assistant 轮次；否则"拒绝→恢复→验证失败"又成死循环源）
-            scope = {max(scope_turns)}
+            # v0.4.29 P0：空 scope（如 codebuddy 路无工具的纯问答回合——
+            # scope_turns 只由工具镜像填充）→ 无审批记录可核对，直接放行。
+            # 旧实现 max(空集) 抛 ValueError 穿透 CLI（用户每问一句"你好"即崩）
+            scope = set()
+
+        def _row_turn(row) -> int | None:
+            import json as _json
+            try:
+                return _json.loads(row["detail"] or "{}").get("_turn")
+            except ValueError:
+                return None
+
+        # 本回合内按 kind 归集被拒记录：同类被拒 ≥2 次 = 反复重试被拒动作
+        denied_by_kind: dict[str, list] = {}
         for r in audit_rows:
-            if r["verdict"] in ("ask_denied", "deny"):
-                import json as _json
-                try:
-                    row_turn = _json.loads(r["detail"] or "{}").get("_turn")
-                except ValueError:
-                    row_turn = None
-                if row_turn in scope:
-                    failed.append("red_actions_approved")
-                    advice_parts.append(
-                        f"动作 {r['kind']}:{r['target'][:60]} 被拒绝/拦截（{r['rule']}），"
-                        "请换用合规方式或征求用户同意")
-                    break
+            if r["verdict"] in ("ask_denied", "deny") and _row_turn(r) in scope:
+                denied_by_kind.setdefault(r["kind"], []).append(r)
+        for kind, rows in denied_by_kind.items():
+            if len(rows) >= 2:
+                last = rows[-1]
+                failed.append("red_actions_approved")
+                advice_parts.append(
+                    f"动作 {last['kind']}:{last['target'][:60]} 被拒绝/拦截后"
+                    f"本回合内又重试 {len(rows) - 1} 次（{last['rule']}）——"
+                    "请改用合规方式或征求用户同意，不要反复重试")
+                break
 
         # 规则 3：写文件回读校验（v0.4.27：同样按回合 scope）
         if check_effects:

@@ -47,17 +47,49 @@ def make_spec(ctx: ToolContext) -> ToolSpec:
         if not prompt:
             return tool_result_err(call, "model", "prompt 不能为空")
         image_path = str(args.get("image_path") or "").strip() or None
-        if image_path and not Path(image_path).is_file():
-            return tool_result_err(
-                call, "model",
-                f"基准图不存在: {image_path}（图生图需要已存在的图片文件）")
+        if image_path:
+            if not Path(image_path).is_file():
+                return tool_result_err(
+                    call, "model",
+                    f"基准图不存在: {image_path}（图生图需要已存在的图片文件）")
+            # v0.4.30：图生图基准图的读取边界——旧实现直接 read_bytes 外发，
+            # 任意本地文件可上传到生图端点。网关句柄没有 check 接口（v0.4.29
+            # 误用 gw.check → AttributeError），改为**结构性约束**：
+            # 只允许工作空间/项目目录内的图片（用户贴的图在 <项目>/tmp、
+            # 产物在 .workspace，均覆盖），并做扩展名 + 魔数双重校验。
+            from axon import vision as _vision
+            try:
+                _p = Path(image_path).resolve()
+                _ws = Path(ctx.workspace).resolve()
+                _proj = Path(ctx.config.project).resolve()
+            except (OSError, ValueError) as e:
+                return tool_result_err(call, "model", f"基准图路径非法: {e}")
+            if not (_ws in _p.parents or _p == _ws
+                    or _proj in _p.parents or _p == _proj):
+                return tool_result_err(
+                    call, "sandbox",
+                    f"基准图必须位于工作空间或项目目录内: {image_path}"
+                    "（先把图片复制进项目，或用 Ctrl+G 收编）")
+            if not _vision.is_image(image_path):
+                return tool_result_err(
+                    call, "model",
+                    f"基准图不是支持的图片格式: {image_path}"
+                    "（支持 png/jpg/jpeg/gif/webp/bmp/tif/tiff）")
+            if not _vision.is_image_content(image_path):
+                return tool_result_err(
+                    call, "model",
+                    f"基准图内容不是图片（扩展名伪装）: {image_path}")
+
+        # v0.4.29：size 缺省时不得把 None 字符串化——旧实现 str(None)="None"
+        # 传入 API（真值，不回落默认）→ 每次不显式传 size 的生图必 400
+        _s = args.get("size")
+        size = (str(_s).strip() or None) if _s else None
 
         ok, msg, meta = image_gen.generate(
-            ctx.config, prompt, image_path=image_path,
-            size=(str(args.get("size")).strip() or None))
+            ctx.config, prompt, image_path=image_path, size=size)
         if not ok:
             # 未配置 / 失败 → 统一转"放弃"话术（用户红线：不换模型硬凑）
-            return tool_result_err(call, "config", f"{msg}\n{_ABANDON_TAIL}")
+            return tool_result_err(call, "permanent", f"{msg}\n{_ABANDON_TAIL}")
         return tool_result_ok(call, msg, meta=meta)
 
     def to_action(args: dict) -> Action:

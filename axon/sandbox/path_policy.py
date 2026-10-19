@@ -105,8 +105,14 @@ def trusted_zones(config) -> list[Path]:
 
 
 def in_zones(path, zones) -> bool:
-    p = Path(os.path.realpath(str(path)))
-    return any(p == z or str(p).startswith(str(z) + os.sep) for z in zones)
+    # v0.4.29：统一 normcase——旧实现与 PathPolicy 的 _norm 口径不一致，
+    # Windows 上对"不存在路径"（写判定）可能一边 deny 命中、一边漏过
+    p = os.path.normcase(os.path.realpath(str(path)))
+    for z in zones:
+        zn = os.path.normcase(str(z))
+        if p == zn or p.startswith(zn + os.sep):
+            return True
+    return False
 
 
 def program_dir_norm() -> str:

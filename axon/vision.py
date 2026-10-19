@@ -112,6 +112,23 @@ def is_image(path) -> bool:
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 
 
+def is_image_content(path) -> bool:
+    """内容级校验（v0.4.30）：读前 16 字节验魔数——防 .pem/.db 改名 .png
+    冒充图片上传（is_image 只看扩展名）。"""
+    try:
+        with Path(str(path)).open("rb") as f:
+            head = f.read(16)
+    except OSError:
+        return False
+    png = b"\x89PNG\r\n\x1a\n"
+    jpg = b"\xff\xd8\xff"
+    return (head.startswith(png)
+            or head.startswith(jpg)
+            or head.startswith(b"GIF8")
+            or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+            or head.startswith(b"BM")
+            or head[:2] == b"II" or head[:2] == b"MM")
+
 # ---------------------------------------------------------------- 描述兜底（B 方案）
 
 def _cache_path(cfg) -> Path:
@@ -130,6 +147,11 @@ def _save_cache(cfg, cache: dict) -> None:
     try:
         p = _cache_path(cfg)
         p.parent.mkdir(parents=True, exist_ok=True)
+        # v0.4.29：上限 500 条（按插入序淘汰最旧）——旧实现只增不删，
+        # 每张唯一图片一条描述，永久驻留
+        if len(cache) > 500:
+            for k in list(cache)[: len(cache) - 500]:
+                cache.pop(k, None)
         p.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
     except OSError:
         pass

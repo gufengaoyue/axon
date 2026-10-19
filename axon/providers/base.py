@@ -66,9 +66,17 @@ class Message:
         for tc in d.get("tool_calls") or []:
             try:
                 args = json.loads(tc["function"]["arguments"] or "{}")
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError):
                 args = {}
-            tcs.append(ToolCall(id=tc.get("id", ""), name=tc["function"]["name"], arguments=args))
+            # v0.4.29：非对象 JSON / 缺 name 都不炸（见 openai_compat 同修）
+            if not isinstance(args, dict):
+                args = {"_raw": str(args)}
+            name = ""
+            try:
+                name = tc["function"]["name"]
+            except (KeyError, TypeError):
+                name = ""
+            tcs.append(ToolCall(id=tc.get("id", ""), name=name, arguments=args))
         return Message(role=d["role"], content=d.get("content"), tool_calls=tcs,
                        tool_call_id=d.get("tool_call_id"), name=d.get("name"))
 

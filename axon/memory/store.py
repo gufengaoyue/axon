@@ -75,10 +75,24 @@ class MemoryStore:
         return self.path.read_text(encoding="utf-8") if self.path.exists() else ""
 
     def _memory_section(self) -> str:
-        """「长期记忆」区文本（进度日志区之前）。"""
+        """「长期记忆」区文本（MEMORY_SECTION 头 → 项目记忆区/进度日志区之前）。
+
+        v0.4.29 P0/P1：旧实现取 `text[:JOURNAL_SECTION]`——把**项目记忆区**
+        也包进来，于是 `_entries()` 解析时最后一个条目的 body 一直吸收到
+        日志区头（含项目记忆全文）→ remove_entry 精确匹配失效、render_block
+        双重注入、预算投影虚高。现在严格按区边界截取。
+        """
         text = self._read_text()
-        idx = text.find(self.JOURNAL_SECTION)
-        return text[:idx] if idx != -1 else text
+        start = text.find(self.MEMORY_SECTION)
+        if start == -1:
+            return ""
+        end = len(text)
+        for sec in (self.PROJECT_SECTION, self.JOURNAL_SECTION):
+            idx = text.find(sec, start + len(self.MEMORY_SECTION))
+            if idx != -1:
+                end = idx
+                break
+        return text[start:end]
 
     def _journal_section(self) -> str:
         """「进度日志」区文本。"""
@@ -146,11 +160,15 @@ class MemoryStore:
         for meta, body in self._entries():
             if not body:
                 continue
+            try:                       # v0.4.29：手改文件的非数字 added_turn 不炸
+                added_turn = int(meta.get("added_turn", "0"))
+            except (TypeError, ValueError):
+                added_turn = 0
             result.append(MemoryEntry(
                 scope=meta.get("scope", "project"),
                 confidence=meta.get("confidence", "inferred"),
                 text=body,
-                added_turn=int(meta.get("added_turn", "0")),
+                added_turn=added_turn,
                 source=meta.get("source", "unknown"),
             ))
         return result
@@ -243,8 +261,14 @@ class MemoryStore:
                 f"记忆条目数达上限 {self.max_entries}，请先整理（删除陈旧条目）再写入")
         if any(e.hash == entry.hash for e in existing):
             return  # 去重：同文本已存在
-        projected = estimate_tokens(self.render_block()) + estimate_tokens(entry.text) + 8
-        if projected > self.token_budget:
+        # v0.4.29：投影对**记忆区全量文本**计 token（旧实现用 render_block——
+        # 它自带 50% 预算截断，投影值永远逼近不了上限，"超预算拒绝"从不触发）
+        full_text = "".join(b for _, b in self._entries())
+        # v0.4.30：投影口径与注入一致（记忆区预算 = token_budget 的 50%）——
+        # 旧实现允许累计到全预算，但注入只给 50% → 后半段条目永远不可见
+        _budget = int(self.token_budget * 0.5)
+        projected = estimate_tokens(full_text) + estimate_tokens(entry.text) + 8
+        if projected > _budget:
             raise MemoryBudgetError(
                 f"写入后将超记忆预算（预计 {projected} > {self.token_budget} token），"
                 "请先整理陈旧条目")
@@ -258,8 +282,21 @@ class MemoryStore:
                 f"# AXON.md — AXON 项目记忆\n\n{self.MEMORY_SECTION}\n\n"
                 f"{self.JOURNAL_SECTION}\n", encoding="utf-8")
         text_now = self.path.read_text(encoding="utf-8")
-        # 分区插入：条目必须落在「长期记忆」区（进度日志区之前）
-        idx = text_now.find(self.JOURNAL_SECTION)
+        # v0.4.30：确保「长期记忆」区头存在——手工/畸形的 AXON.md 可能没有它，
+        # 此时按旧锚点会把条目插到区外 → entries() 永不可见（静默丢失 + 去重
+        # 失效 → 反复追加膨胀）
+        if self.MEMORY_SECTION not in text_now:
+            j0 = text_now.find(self.JOURNAL_SECTION)
+            if j0 == -1:
+                text_now = text_now.rstrip() + f"\n\n{self.MEMORY_SECTION}\n"
+            else:
+                text_now = text_now[:j0] + f"{self.MEMORY_SECTION}\n\n" + text_now[j0:]
+        # v0.4.29：插入锚点优先 PROJECT_SECTION——条目必须落在「长期记忆」区
+        # （旧实现只找 JOURNAL_SECTION：有项目记忆时条目插到项目记忆区之后 →
+        # 正文被项目记忆污染 → remove_entry 精确匹配失效 + 双重注入）
+        idx = text_now.find(self.PROJECT_SECTION)
+        if idx == -1:
+            idx = text_now.find(self.JOURNAL_SECTION)
         if idx == -1:
             text_now = text_now.rstrip() + f"\n\n{self.JOURNAL_SECTION}\n"
             idx = text_now.find(self.JOURNAL_SECTION)
@@ -277,11 +314,37 @@ class MemoryStore:
         return True
 
     def _rewrite(self, entries: list[tuple[dict, str]]) -> None:
-        parts = ["# AXON.md — AXON 长期记忆\n"]
+        """重写「长期记忆」区（v0.4.29 P0 修复：旧实现把整文件重构为
+        "# 标题 + entry 列表"，**项目记忆与进度日志被整体抹掉**——数据丢失）。
+
+        现按 SECTION 边界做局部手术：只替换 [MEMORY_SECTION, 下一区) 区间，
+        标题前缀、项目记忆区、进度日志区原文原样保留。"""
+        new_mem = self._render_memory_section(entries)
+        text = self._read_text()
+        start = text.find(self.MEMORY_SECTION)
+        if start == -1:
+            # 无骨架（旧文件/手工文件）→ 整体重建三区（保留不了其他区内容，
+            # 但至少恢复完整骨架而不是丢成一页 entry 列表）
+            body = f"# AXON.md — AXON 项目记忆\n\n{new_mem}\n\n{self.JOURNAL_SECTION}\n"
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(body, encoding="utf-8")
+            return
+        end = len(text)
+        for sec in (self.PROJECT_SECTION, self.JOURNAL_SECTION):
+            idx = text.find(sec, start + len(self.MEMORY_SECTION))
+            if idx != -1:
+                end = idx
+                break
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(text[:start] + new_mem.rstrip() + "\n\n"
+                             + text[end:], encoding="utf-8")
+
+    def _render_memory_section(self, entries: list[tuple[dict, str]]) -> str:
+        """把 entries 渲染为「长期记忆」区文本（含区头）。"""
+        parts = [self.MEMORY_SECTION + "\n"]
         for meta, body in entries:
             if not body:
                 continue
             kv = " ".join(f"{k}={v}" for k, v in meta.items())
             parts.append(f"<!-- entry: {kv} -->\n{body}\n")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text("\n".join(parts), encoding="utf-8")
+        return "\n".join(parts)

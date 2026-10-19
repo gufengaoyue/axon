@@ -173,12 +173,10 @@ def make_global_spec(ctx) -> ToolSpec:
             return tool_result_err(call, "model", "长期记忆存储不可用")
         section = str(args.get("section") or "其他")
         text = str(args.get("text") or "")
-        # 经沙箱网关（单文件豁免在 PathPolicy 中声明，v0.4.21）
-        act = Action(kind="fs_write", target=str(store.path),
-                     detail={"action": "global_memory_add", "section": section})
-        decided = gw.check(act)
-        if not decided.allowed:
-            return tool_result_err(call, "sandbox", f"被沙箱拒绝：{decided.reason}")
+        # v0.4.30：此处调 gw.check 是无效调用（网关句柄无 check 接口，
+        # 每次 global_memory_write 都 AttributeError 失败）——该动作已由
+        # to_action 声明为 fs_write 并在网关 pre 阶段判定（长期记忆文件在
+        # PathPolicy 中是单文件豁免），handler 内无需二次判定
         ok, msg = store.append(section, text)
         if ok:
             return tool_result_ok(call, f"✅ {msg}",

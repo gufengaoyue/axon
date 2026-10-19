@@ -143,7 +143,9 @@ class ClipboardWatcher:
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread = None
+        t, self._thread = self._thread, None
+        if t is not None:
+            t.join(timeout=0.5)     # v0.4.29：等线程真正退出（防 stop→start 并行）
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -356,6 +358,9 @@ def parse_input(text: str, workspace) -> tuple[str, list[Path]]:
     found: list[Path] = []
     rewritten = text
     ext_alt = "|".join(e.lstrip(".") for e in sorted(IMAGE_EXTS))
+    # v0.4.29：同一路径只收编一次——旧实现 ①-a（引号）/①-b（裸路径）会
+    # 各匹配一次 → 复制出 图片2.png 孤儿副本，第二次 replace 已无目标
+    absorbed: dict[str, Path] = {}
 
     def _absorb(token: str, whole: str) -> None:
         """把 token 指向的图片收编为附件，并把 whole 替换成 @名称。"""
@@ -364,15 +369,24 @@ def parse_input(text: str, workspace) -> tuple[str, list[Path]]:
         if p.suffix.lower() not in IMAGE_EXTS or not p.is_file():
             return
         try:
+            key = str(p.resolve())
+            if key in absorbed:                        # 已收编 → 复用，不再复制
+                found.append(absorbed[key])
+                if whole in rewritten:
+                    rewritten = rewritten.replace(whole, f"@{absorbed[key].name}")
+                return
             if directory in p.resolve().parents:
+                absorbed[key] = p
                 found.append(p)                       # 已在附件目录 → 直接引用
                 return
         except OSError:
             return
         copied = copy_files(workspace, [p])
         if copied:
+            absorbed[key] = copied[0]
             found.append(copied[0])
-            rewritten = rewritten.replace(whole, f"@{copied[0].name}")
+            if whole in rewritten:
+                rewritten = rewritten.replace(whole, f"@{copied[0].name}")
 
     # ①-a 引号包裹的路径（可含空格）
     for m in re.finditer(r"[\"']([^\"'\n]+)[\"']", text):

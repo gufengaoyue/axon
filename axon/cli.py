@@ -141,6 +141,8 @@ class StatusLine:
         self._watching = False
         self._line_len = 0             # 上一帧长度（擦除行尾用，v0.2.9 修残影）
         self._two_line = False         # 双行模式：状态行 + 常驻输入行（v0.2.9）
+        self._ctl_lock = threading.Lock()   # v0.4.29：_start/_stop 跨线程互斥
+        self._render_paused = False     # v0.4.29：打印窗口期暂停渲染（防粘连）
 
     # ---- 内部 ----
     def _input_line(self) -> str:
@@ -155,19 +157,32 @@ class StatusLine:
         return "axon ❯ （执行中可直接输入补充，回车提交）"
 
     def _write(self, text: str) -> None:
-        """重写当前行并**擦除行尾**（此前仅 \r 覆盖 → 短行留下长行残影，v0.2.9 修复）。"""
-        pad = max(0, self._line_len - len(text))
+        """重写当前行并**擦除行尾**（此前仅 \r 覆盖 → 短行留下长行残影，v0.2.9 修复）。
+
+        v0.4.29：pad 按**终端列宽**计算（CJK 字符占 2 列）——旧实现按字符数
+        算，中文状态行（"正在执行 xxx，请稍等..."）长帧切短帧时擦不干净，
+        留下残影。
+        """
+        import unicodedata
+
+        def _width(s: str) -> int:
+            return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                       for c in s)
+
+        pad = max(0, self._line_len - _width(text))
         try:
             sys.stdout.write("\r" + text + " " * pad)
             sys.stdout.flush()
         except (ValueError, OSError):
             return
-        self._line_len = len(text)
+        self._line_len = _width(text)
 
     def _render_once(self, i: int = 0, el: float | None = None) -> str:
         """渲染一帧（抽出来便于单测；返回写入的文本）。"""
         if getattr(self, "_live_active", False):
             return ""                        # v0.4.20：Live 活动期间不写（防冲突刷屏）
+        if getattr(self, "_render_paused", False):
+            return ""                        # v0.4.29：打印窗口期不写（防粘连）
         if el is None:
             el = time.monotonic() - self._t0
         if self._notes and i % 20 == 0:          # 每 ~2s 轮换操作概要
@@ -210,6 +225,14 @@ class StatusLine:
             pass
 
     def _start(self) -> None:
+        # v0.4.29 P2：加锁——看门狗线程（thinking→_start）与审批工作线程
+        # （status.idle→_stop）会跨线程调用，旧实现无锁，_running/_evt/
+        # _thread/_line_len 竞争（"仅主线程调用"的类注释早已被 v0.4.5
+        # 看门狗与 v0.4.14 并行审批打破）。_spin 线程不取锁，不死锁。
+        with self._ctl_lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         if not self._tty or self._running:
             return
         # v0.4.20：rich Live（思考滚动框）活动期间**禁止**裸 ANSI 转圈——
@@ -240,16 +263,17 @@ class StatusLine:
         self._thread.start()
 
     def _stop(self) -> None:
-        if not self._running:
-            return
-        self._running = False
-        self._evt.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
-        # join 后 _spin 的收尾清理已跑完（屏幕无双行结构）→ 占位标记复位，
-        # 下次 _start() 重新建立（v0.4.28：修 spinner 重启重复占位导致的错位）
-        self._two_line_primed = False
+        with self._ctl_lock:
+            if not self._running:
+                return
+            self._running = False
+            self._evt.set()
+            if self._thread is not None:
+                self._thread.join(timeout=1.0)
+                self._thread = None
+            # join 后 _spin 的收尾清理已跑完（屏幕无双行结构）→ 占位标记复位，
+            # 下次 _start() 重新建立（v0.4.28：修 spinner 重启重复占位导致的错位）
+            self._two_line_primed = False
 
     # ---- 状态协议（AgentLoop / CodebuddyRunner 调用） ----
     def thinking(self, note: str = "") -> None:
@@ -318,13 +342,15 @@ class StatusLine:
         sys.stdout.flush()
 
     def stream_write(self, text: str) -> None:
-        self.bump()
-        self._close_thinking()
         """模型流式文本直写（记录未换行状态，供面板/页脚前补换行）。
 
         v0.4.16：正文流超过 TEXT_MAX_LINES 行的部分静默累积（防霸屏），
         超限时打一行折叠提示；verbose 模式不受限。
+        （v0.4.29：docstring 归位——旧实现放在两条语句之后，成了无效果
+        字符串表达式）
         """
+        self.bump()
+        self._close_thinking()
         self._stop()
         self._text_full = getattr(self, "_text_full", "") + str(text)
         if not self.verbose:
@@ -583,6 +609,8 @@ class StatusLine:
         而连续同类工具走"合并"分支不再启动 → 长任务中途再无任何动效。"""
         if ok:
             # v0.4.13：成功也给一行简短反馈（模块化可分辨），detail 折叠
+            # v0.4.29：走 _print（内部暂停渲染+清行，防与 spinner 帧粘连），
+            # 且**不停止转圈**——v0.3.0 的"长任务中途保持动效"语义不变
             self.ensure_newline()
             first = ""
             if detail:
@@ -630,11 +658,42 @@ class StatusLine:
             self._flush_tool_run()
 
     def _print(self, text: str, style: str = "") -> None:
-        if self.console is not None:
-            self.console.print(text, markup=False, highlight=False, style=style)
-        else:
-            sys.stdout.write(text + "\n")
-            sys.stdout.flush()
+        """打印一行（v0.4.29：打印前**暂停转圈渲染并清状态行**——不停止线程。
+
+        v0.3.0 要求"工具成功后转圈继续"（长任务中途不能无动效），但旧实现
+        直接 console.print → ✓ 行与 spinner 帧粘连成擦不掉的残影。暂停窗口
+        极短（一次 print），线程保持存活，动效不受影响。
+        """
+        self._pause_render()
+        try:
+            if self.console is not None:
+                self.console.print(text, markup=False, highlight=False, style=style)
+            else:
+                sys.stdout.write(text + "\n")
+                sys.stdout.flush()
+        finally:
+            self._resume_render()
+
+    def _pause_render(self) -> None:
+        """暂停 spinner 渲染并清空状态区（v0.4.29）。"""
+        with self._ctl_lock:
+            self._render_paused = True
+            if not self._running:
+                return
+            try:
+                if self._two_line:
+                    # 清状态行 + 输入行，光标回到状态行行首
+                    sys.stdout.write("\x1b[1A\r\x1b[2K" + "\n\r\x1b[2K" + "\x1b[1A\r")
+                else:
+                    sys.stdout.write("\r" + " " * (self._line_len + 4) + "\r")
+                sys.stdout.flush()
+                self._line_len = 0
+            except (ValueError, OSError):
+                pass
+
+    def _resume_render(self) -> None:
+        with self._ctl_lock:
+            self._render_paused = False
 
 
 # ---------------------------------------------------------------- 审批器
@@ -752,12 +811,14 @@ def build_app(cfg, prompter=None, status=None):
 
     # MCP 连接器（可选；失败不阻塞启动）
     mcp_errors: list[str] = []
+    mcp_connectors: list = []          # v0.4.29：保留引用——退出时显式 close
     for sv in cfg.mcp.servers:
         if not sv.enabled:
             continue
         try:
             conn = MCPConnector(sv, gateway)
             conn.connect()
+            mcp_connectors.append(conn)
             for spec in conn.tool_specs():
                 registry.register(spec)
         except (MCPUnavailable, Exception) as e:  # noqa: BLE001 - 启动不阻塞
@@ -776,9 +837,11 @@ def build_app(cfg, prompter=None, status=None):
     return {
         "cfg": cfg, "store": store, "audit": audit, "memory": memory_store,
         "pending_resume_note": None, "keyboard": None,
+        "pending_resume_note_for": "",     # v0.4.29：resume note 的归属 session
         "registry": registry, "gateway": gateway, "ctx": ctx_builder,
         "compactor": compactor, "verifier": verifier, "provider": provider,
         "loop": loop, "mcp_errors": mcp_errors, "console": _make_console(),
+        "mcp_connectors": mcp_connectors,  # v0.4.29：退出时逐个 close
     }
 
 
@@ -863,11 +926,21 @@ def _print_turn_result(console, r: TurnResult, elapsed: float | None = None) -> 
             print(f"── {r.note}")
 
 
-def _compose_user_input(app: dict, text: str) -> str:
-    """resume 观察消息（<resume_context>）只在恢复后的首轮注入模型（设计 §4.4）。"""
-    note = app.pop("pending_resume_note", None)
+def _compose_user_input(app: dict, text: str, session=None) -> str:
+    """resume 观察消息（<resume_context>）只在恢复后的首轮注入模型（设计 §4.4）。
+
+    v0.4.29 P1：按 session 匹配消费——补沉淀回合（_recover_stale_sessions
+    对旧会话跑 _run_turn）会抢先 pop 掉当前会话的 note，导致 resume 首轮
+    丢失上下文、"断点续做"失效。note 只属于设置时登记的那个 session。
+    """
+    note = app.get("pending_resume_note")
     if not note:
         return text
+    if session is not None:
+        want = app.get("pending_resume_note_for")
+        if want and getattr(session, "id", "") != want:
+            return text          # 别的会话的 note（如补沉淀回合）→ 不消费
+    app.pop("pending_resume_note", None)
     return f"{note}\n\n---\n{text}"
 
 
@@ -876,7 +949,7 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
     t_turn = time.monotonic()                    # v0.4.22：本回合用时（用户要求）
     console = app["console"]
     loop = app["loop"]
-    text = _compose_user_input(app, text)
+    text = _compose_user_input(app, text, session)
     kb = app.get("keyboard")
     # v0.4.16：每回合重置正文流式计数（防霸屏的限行按回合计）
     st = loop.status
@@ -889,15 +962,12 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
         kb.start()
     app["loop"].status.start_watchdog()      # v0.4.5：静默期自动转圈
     show_thinking = bool(getattr(app["cfg"].agent, "show_thinking", True))
-    interject = app.get("interject_bridge")
-    if interject is not None and getattr(app["cfg"].agent, "stream_interject", True):
-        import asyncio
-        try:
-            interject.bind(asyncio.get_running_loop())
-        except RuntimeError:
-            interject = None
-    else:
-        interject = None
+    # v0.4.29 P1：插嘴桥**直接下传**不再在此 bind——同步线程里没有运行中的
+    # 事件循环，asyncio.get_running_loop() 必抛 RuntimeError，旧实现把
+    # interject 置 None → codebuddy/openai 两路都不消费 → 插嘴永久丢失。
+    # bind 改由 codebuddy._drive（有循环）内做；openai 路走 bridge fallback。
+    interject = app.get("interject_bridge") \
+        if getattr(app["cfg"].agent, "stream_interject", True) else None
     try:
         result = loop.run(session, text, on_text=app["loop"].status.stream_write,
                           on_stuck=on_stuck, images=images or [],
@@ -906,12 +976,17 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
                           interject=interject)
     finally:
         if interject is not None:
-            interject.reset()
+            # v0.4.29：只清 asyncio 队列——fallback 残留留给 repl 的
+            # _settle_interjections 确认（直接 reset 会丢边界插嘴）
+            interject.reset_queue()
         app["loop"].status.stop_watchdog()
         # v0.4.25：任何出口（正常/异常/Ctrl+C 中断）都收思考滚动框——
         # Live 不关闭则其刷新线程持续重绘终端（用户实测"中断后一直转圈"），
         # 且 _print_turn_result 的页脚会被 Live 覆盖。
         st._close_thinking()
+        # v0.4.30：先停转圈——无终答文本的回合（中断/max_turns/超时）在
+        # finally 后直接打页脚，旧实现 spinner 仍在跑，\r 帧把页脚擦成半截
+        st._stop()
         if kb is not None:
             kb.stop()
         left = kb.current_input() if kb is not None else ""
@@ -930,8 +1005,9 @@ def _run_turn(app: dict, session, text: str, on_stuck, images: list | None = Non
 def _settle_interjections(app: dict, session) -> None:
     """回合结束的插嘴兜底（v0.4.15）。
 
-    - `stream_interject` 开启（默认）：插嘴已在执行中即时注入，这里只处理
-      **未入队的残留**（bridge 未绑定/绑定失败时键盘线程 put 不进去的内容）；
+    - `stream_interject` 开启（默认）：插嘴已在执行中轮次边界注入；这里处理
+      **边界残留**（回合刚好结束时到达、没被下一轮消费的内容）——弹确认
+      作为下一轮注入（v0.4.29：旧实现直接 return，残留永久丢失）；
     - 关闭时退回旧行为：弹确认 → 作为新一轮注入。
     """
     kb = app.get("keyboard")
@@ -939,27 +1015,63 @@ def _settle_interjections(app: dict, session) -> None:
         return
     console = app.get("console")
     stream_on = bool(getattr(app["cfg"].agent, "stream_interject", True))
+    bridge = app.get("interject_bridge")
+    # v0.4.29：先收 bridge fallback 残留（openai 路未消费的插嘴）
+    pending_texts: list[str] = []
+    if bridge is not None:
+        pending_texts.extend(bridge.take_all())
     if stream_on:
-        # 执行中注入模式下，queue 已被 provider 消费；残留仅来自未提交缓冲
-        # （_run_turn 的 finally 已提示），此处无需再弹确认
-        return
-    while kb.has_pending():
-        text = kb.pop_all()
+        # 轮次边界已注入；残留仅来自"回合结束边界"——合并 kb.queue 一并确认
+        # （防御上限：kb 异常时 has_pending 永真会导致死循环——测试替身实测）
+        for _ in range(10):
+            if not kb.has_pending():
+                break
+            pending_texts.append(kb.pop_all())
+        if not pending_texts:
+            return
+        text = "\n".join(str(t) for t in pending_texts if t and str(t).strip())
+        if not text.strip():
+            return
         if console is not None:
-            console.print(f"── 你在任务执行中输入：{text}", style="yellow", markup=False)
-        else:  # pragma: no cover
-            print(f"── 你在任务执行中输入：{text}")
+            console.print(f"── 你在任务执行末尾输入：{text}",
+                          style="yellow", markup=False)
         try:
             ans = input("  作为补充发送给智能体？[Y/n]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
-            if console is not None:
-                console.print("  已保留，未发送", style="dim")
             return
         if ans in ("", "y", "yes"):
             _run_turn(app, session, wrap_interjection(text), _ask_continue)
-        else:
+        return
+    # v0.4.30：非流式分支同样以 pending_texts 为准——旧实现只读 kb.queue，
+    # 而 CLI 恒有 on_submit（单数据流）→ 该队列恒空 → 插嘴被 take_all 取出后丢弃
+    for _ in range(10):
+        if not kb.has_pending():
+            break
+        pending_texts.append(kb.pop_all())
+    text_all = "\n".join(str(t) for t in pending_texts if t and str(t).strip())
+    if not text_all.strip():
+        return
+    if console is not None:
+        console.print(f"── 你在任务执行中输入：{text_all}", style="yellow", markup=False)
+    else:  # pragma: no cover
+        print(f"── 你在任务执行中输入：{text_all}")
+    try:
+        ans = input("  作为补充发送给智能体？[Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        if console is not None:
+            console.print("  已保留，未发送", style="dim")
+        return
+    if ans in ("", "y", "yes"):
+        try:
+            _run_turn(app, session, wrap_interjection(text_all), _ask_continue)
+        except Exception as e:  # noqa: BLE001 - v0.4.30：补发回合异常不终结 REPL
             if console is not None:
+                console.print(f"  （补发失败：{type(e).__name__}: {e}）",
+                              style="yellow", markup=False)
+    else:
+        if console is not None:
                 console.print("  已丢弃", style="dim")
 
 
@@ -998,7 +1110,12 @@ def run_repair_mode(cfg, console) -> int:
         return 0
     say(f"✗ 检测到损坏: {detail[:200]}", style="yellow")
     say("开始修复（原库会先备份，只搬不删）…")
-    result = repair_database(db, SCHEMA)
+    try:
+        result = repair_database(db, SCHEMA)
+    except Exception as e:  # noqa: BLE001 - v0.4.29：修复工具自身异常不外抛
+        say(f"修复过程异常: {type(e).__name__}: {e}", style="red")
+        say("坏库与已产生的备份均保留在原位，未做替换", style="yellow")
+        return 1
     if not result.get("ok"):
         say(f"修复失败: {result.get('note')}", style="red")
         say(f"备份与半成品已保留：{result.get('backup')} / {result.get('repaired')}")
@@ -1532,7 +1649,11 @@ def _make_completers(state: dict):
             text = document.text_before_cursor
             if not text.startswith(">"):
                 return
-            typed = text[1:].strip().lstrip("./")
+            typed = text[1:].strip()
+            # v0.4.29：只剥 `./` / `.\` 前缀（旧 lstrip("./") 会把 `.workspace`
+            # 的前导点也吃掉——与 attachments.parse_references 的历史修复对齐）
+            while typed.startswith(("./", ".\\")):
+                typed = typed[2:]
             entries = state.get("project_entries")
             stamp = time.monotonic()
             if entries is None or stamp - state.get("files_ts", 0) > self._CACHE_TTL:
@@ -1632,6 +1753,31 @@ def _make_prompt_session(state: dict):
                          complete_while_typing=True)
 
 
+def _cleanup_app(app: dict) -> None:
+    """进程退出前的资源清理（v0.4.29 P2）：MCP 连接器、剪贴板监听、键盘采集。
+
+    旧实现这些资源全部依赖进程退出回收——MCP 子进程只能等 stdin EOF 自行
+    退出，剪贴板线程在 /exit 后继续轮询。
+    """
+    for conn in app.get("mcp_connectors") or []:
+        try:
+            conn.close()
+        except Exception:       # noqa: BLE001 - 清理失败不阻塞退出
+            pass
+    cw = app.get("clipwatch")
+    if cw is not None:
+        try:
+            cw.stop()
+        except Exception:       # noqa: BLE001
+            pass
+    kb = app.get("keyboard")
+    if kb is not None:
+        try:
+            kb.stop()
+        except Exception:       # noqa: BLE001
+            pass
+
+
 def repl(app: dict, session, resume_note: str | None = None) -> int:
     cfg = app["cfg"]
     console = app["console"]
@@ -1670,6 +1816,9 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
     if resume_note is not None:
         note_text = getattr(resume_note, "content", str(resume_note))
         app["pending_resume_note"] = note_text
+        # v0.4.29：登记归属 session——防补沉淀回合（对旧会话跑 _run_turn）
+        # 抢先消费掉当前会话的 resume_context
+        app["pending_resume_note_for"] = getattr(session, "id", "")
         _replay_history(app, session)      # 先展示历史对话（含用户提问）
         if console is not None:
             console.print("── <resume_context> 观察消息将在本轮注入模型：",
@@ -1701,8 +1850,11 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
             line = (ps.prompt() if ps is not None else input("axon> ")).strip()
         except EOFError:
             print()
-            _maybe_summarize(app, session_ref[0])
-            _mark_ended(app, session_ref[0])
+            try:
+                _maybe_summarize(app, session_ref[0])
+                _mark_ended(app, session_ref[0])
+            finally:
+                _cleanup_app(app)          # v0.4.30：finally 保证收尾必执行
             return 0
         except KeyboardInterrupt:
             print("\n(已取消本次输入，输入 /exit 退出)")
@@ -1721,10 +1873,21 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
             else:
                 continue
         if line.startswith("/"):
-            session = handle_slash(app, session, line, state, ps)
+            # v0.4.30：斜杠命令异常不得终结 REPL（/audit --export xml 的
+            # ValueError、导出路径 OSError 等旧实现直接 traceback 退出）
+            try:
+                session = handle_slash(app, session, line, state, ps)
+            except Exception as e:  # noqa: BLE001
+                if console is not None:
+                    console.print(f"[命令失败] {type(e).__name__}: {e}",
+                                  style="yellow", markup=False)
+                continue
             if session is None:
-                _maybe_summarize(app, session_ref[0])
-                _mark_ended(app, session_ref[0])
+                try:
+                    _maybe_summarize(app, session_ref[0])
+                    _mark_ended(app, session_ref[0])
+                finally:
+                    _cleanup_app(app)      # v0.4.30
                 return 0
             session_ref[0] = session
             continue
@@ -1756,7 +1919,7 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
         try:
             n_msgs_before = len(store.load_messages(session_ref[0].id))
         except Exception:                     # noqa: BLE001
-            n_msgs_before = 0
+            n_msgs_before = None              # v0.4.29：取数失败 → 跳过 L1
         try:
             result = _run_turn(app, session_ref[0], line, _ask_continue, images=images)
         except KeyboardInterrupt:
@@ -1781,8 +1944,9 @@ def repl(app: dict, session, resume_note: str | None = None) -> int:
         # L1 触发式沉淀（v0.4.24）：有信号（失败恢复/打转/插嘴纠正/自检⚠）
         # 才调模型写本回合教训；L0 规则式教训已随进度日志注入，无需模型
         try:
-            turn_msgs = store.load_messages(session_ref[0].id)[n_msgs_before:]
-            _maybe_note_turn(app, session_ref[0], turn_msgs, result)
+            if n_msgs_before is not None:     # v0.4.29：取数失败 → 跳过（防误触发）
+                turn_msgs = store.load_messages(session_ref[0].id)[n_msgs_before:]
+                _maybe_note_turn(app, session_ref[0], turn_msgs, result)
         except Exception:                     # noqa: BLE001 - 沉淀失败不阻塞对话
             pass
 
@@ -1837,6 +2001,11 @@ def handle_slash(app: dict, session, line: str, state: dict, ps) -> object | Non
         app["gateway"].bind(session.id, 0)
         state.update({"model": f"{session.provider}/{session.model}",
                       "session": session.id})
+        # v0.4.30：会话内 /resume 也要登记恢复上下文 + 刷新思考存档会话号
+        app["pending_resume_note"] = note
+        app["pending_resume_note_for"] = getattr(session, "id", "")
+        st = app["loop"].status
+        st.session_id = getattr(session, "id", "") or ""
         out(note)
     elif cmd == "/delproj":
         return _cmd_delproj(app, session, line[len(cmd):].strip(), out)
@@ -1960,6 +2129,10 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"[配置错误] {e}", file=sys.stderr)
         return 2
+    except Exception as e:  # noqa: BLE001 - 畸形 config.yml（yaml.YAMLError 等）
+        print(f"[配置错误] {type(e).__name__}: {e}", file=sys.stderr)
+        print("  请检查 config.yml 的 YAML 语法（缩进/冒号/引号）", file=sys.stderr)
+        return 2
 
     console = _make_console()
     status = StatusLine(console)
@@ -1981,10 +2154,13 @@ def main(argv: list[str] | None = None) -> int:
     # 会话恢复前置（v0.2.0：sessions.db 程序级全局共享，支持跨项目恢复）
     resume_note = None
     session = None
-    if args.resume:
+    if args.resume and args.resume != "__pick__":
         try:
             pre_store = SessionStore(connect(cfg.db_path))
-            session, _, resume_note = load_for_resume(pre_store, args.resume)
+            try:
+                session, _, resume_note = load_for_resume(pre_store, args.resume)
+            finally:
+                pre_store.conn.close()      # v0.4.29：探测连接不泄漏
         except ValueError as e:
             print(f"[提示] {e}", file=sys.stderr)
             session = None
@@ -1997,36 +2173,39 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[提示] 已切换到项目 {cfg.project}", file=sys.stderr)
     if args.resume == "__pick__" and session is None:
         pre_store = SessionStore(connect(cfg.db_path))
-        items = pre_store.list_sessions_all(15)
-        if not items:
-            print("[提示] 没有历史会话", file=sys.stderr)
-            return 2
-        print("最近的会话（输入编号恢复，回车取消）：")
-        for i, item in enumerate(items, 1):
-            s = item["session"]
-            print(f"  {i:>2}. {s.id[:8]}  {s.updated_at[:16]}  "
-                  f"{item['project_name']:<12} {(item['title'] or '(无标题)')[:36]}")
-        if sys.stdin.isatty():
-            try:
-                pick = input("编号/id 前缀: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
+        try:                                # v0.4.29：探测连接不泄漏
+            items = pre_store.list_sessions_all(15)
+            if not items:
+                print("[提示] 没有历史会话", file=sys.stderr)
                 return 2
-            if pick:
-                arg = items[int(pick) - 1]["session"].id[:8] if pick.isdigit()                     and 1 <= int(pick) <= len(items) else pick
+            print("最近的会话（输入编号恢复，回车取消）：")
+            for i, item in enumerate(items, 1):
+                s = item["session"]
+                print(f"  {i:>2}. {s.id[:8]}  {s.updated_at[:16]}  "
+                      f"{item['project_name']:<12} {(item['title'] or '(无标题)')[:36]}")
+            if sys.stdin.isatty():
                 try:
-                    session, _, resume_note = load_for_resume(pre_store, arg)
-                except ValueError as e:
-                    print(f"[提示] {e}", file=sys.stderr)
+                    pick = input("编号/id 前缀: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
                     return 2
-                if session is not None and session.project_dir != str(cfg.project):
-                    cfg.project = Path(session.project_dir)
-                    if not cfg.workspace_explicit:
-                        cfg.workspace = (cfg.project / ".workspace").resolve()
-                    ensure_dirs(cfg)
-                    print(f"[提示] 已切换到项目 {cfg.project}", file=sys.stderr)
-        else:
-            return 2
+                if pick:
+                    arg = items[int(pick) - 1]["session"].id[:8] if pick.isdigit()                     and 1 <= int(pick) <= len(items) else pick
+                    try:
+                        session, _, resume_note = load_for_resume(pre_store, arg)
+                    except ValueError as e:
+                        print(f"[提示] {e}", file=sys.stderr)
+                        return 2
+                    if session is not None and session.project_dir != str(cfg.project):
+                        cfg.project = Path(session.project_dir)
+                        if not cfg.workspace_explicit:
+                            cfg.workspace = (cfg.project / ".workspace").resolve()
+                        ensure_dirs(cfg)
+                        print(f"[提示] 已切换到项目 {cfg.project}", file=sys.stderr)
+            else:
+                return 2
+        finally:
+            pre_store.conn.close()
 
     try:
         app = build_app(cfg, prompter=TTYPrompter(console, status), status=status)
@@ -2080,9 +2259,23 @@ def main(argv: list[str] | None = None) -> int:
         session = store.get_session(sid)
     app["gateway"].bind(session.id, 0)
 
+    status.session_id = getattr(session, "id", "") or ""
+    # v0.4.30：会话号早设——-p 单发与启动补沉淀的思考存档不再落到 session.log
+    status.session_id = getattr(session, "id", "") or ""
     if args.prompt is not None:
-        _run_turn(app, session, args.prompt, _ask_continue)
-        status.idle()
+        # v0.4.30：-p + --resume 也要注入 <resume_context>（旧实现只在 repl 里
+        # 登记 pending_resume_note → 非交互模式丢掉恢复上下文）
+        if resume_note is not None:
+            app["pending_resume_note"] = getattr(resume_note, "content",
+                                                 str(resume_note))
+            app["pending_resume_note_for"] = getattr(session, "id", "")
+        try:
+            _run_turn(app, session, args.prompt, _ask_continue)
+        finally:
+            try:
+                status.idle()
+            finally:
+                _cleanup_app(app)          # v0.4.30：idle 异常也不跳过清理
         return 0
 
     return repl(app, session, resume_note)

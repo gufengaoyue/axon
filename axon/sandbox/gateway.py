@@ -13,6 +13,7 @@ import hashlib
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Literal
 
@@ -67,6 +68,15 @@ def canonical_json(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+# v0.4.29：会话授权缓存**不降级**的高危规则前缀（结构性风险，不应被
+# 一次 [a]lways 吞掉——尤其批量删除阈值）
+_CACHE_EXEMPT_RULES = (
+    "command:batch_delete", "command:delete_unbounded", "command:delete_outside",
+    "command:system_path", "command:fs_root", "command:deny_program_dir",
+    "command:deny_path", "command:interp_write_dynamic",
+)
+
+
 def action_fingerprint(action: Action, granularity: str) -> str:
     """授权缓存键。prefix = 命令程序 + 首参数特征 / 路径取父目录；exact = 全量。
 
@@ -77,6 +87,8 @@ def action_fingerprint(action: Action, granularity: str) -> str:
       python -c "<任意代码>" → shell|python|-c          ← 同类共享
       python script.py      → shell|python|@<脚本目录>
       rm a.txt              → shell|rm|@<父目录>
+    v0.4.29：flag 类键对"像路径"的实参混入父目录（`rm -rf /etc/x` →
+      shell|rm|-rf|@/etc），一次 always 不再放行任意目标。
     """
     if granularity == "exact":
         return hashlib.sha256(
@@ -87,7 +99,20 @@ def action_fingerprint(action: Action, granularity: str) -> str:
         head = parts[0] if parts else ""
         second = parts[1] if len(parts) > 1 else ""
         if second.startswith("-"):
-            tag = second                      # flag 类（-c/-e/--version…）
+            # v0.4.29 P1：flag 类键混入**首个"像路径"的实参的父目录**——旧实现
+            # 仅 `shell|rm|-rf`（无任何目标信息），一次 [a]lways 会放行之后
+            # 任意 `rm -rf <任意路径>`（含批量删除阈值也被降级）。
+            # 只认路径形态实参（含分隔符、无空白/引号）——代码串/普通参数不混入，
+            # 保持 v0.2.2「python -c 同类共享」的修复意图。
+            tag = second
+            for t in parts[2:]:
+                if t.startswith("-"):
+                    continue
+                if ("/" in t or "\\" in t) and not any(c in t for c in ' "\''):
+                    norm = t.replace("\\", "/").strip('"\'')
+                    parent = norm.rsplit("/", 1)[0] if "/" in norm else "@cwd"
+                    tag = f"{second}|@{parent}"
+                break
         elif second:
             # 路径类 → 取父目录（同目录内的同程序命令共享授权）
             norm = second.replace("\\", "/").strip('"\'')
@@ -168,7 +193,11 @@ class SandboxGateway:
         # 会话级授权缓存：只把 ask 降级为 allow（审批是用户显式决策）
         if decision.verdict == "ask":
             key = action_fingerprint(action, self.config.sandbox.approval_granularity)
-            if key in self._auth_cache:
+            # v0.4.29 P1：高危规则的 ask **不降级**——批量删除/不可判定删除/
+            # 区外删除/系统路径/盘根/mcp 是结构性风险，不能因一次 always 被
+            # 会话缓存吞掉（旧实现连同批删除阈值一并降级）
+            if key in self._auth_cache and not decision.rule.startswith(
+                    _CACHE_EXEMPT_RULES):
                 decision = Decision("allow", "session_cache", "会话级授权缓存命中")
         return decision
 
@@ -200,7 +229,14 @@ class SandboxGateway:
                 key = action_fingerprint(action, self.config.sandbox.approval_granularity)
                 self._auth_cache[key] = None
             if approval.edited_detail:
-                action = Action(**{**action.__dict__, "detail": approval.edited_detail})
+                # v0.4.29 P2：用户改参数放行时**同步重建 target**——旧实现只换
+                # detail/args，action.target 还是旧值 → 快照路径、post hook、
+                # 审计记录的 target 与实际执行不一致（审计记旧目标、执行新参数）
+                new_action = spec.to_action(approval.edited_detail) if spec.to_action \
+                    else self._default_action(spec, approval.edited_detail)
+                action = Action(**{**action.__dict__,
+                                   "detail": approval.edited_detail,
+                                   "target": new_action.target})
                 args = approval.edited_detail
 
         # 步骤 3.5：副作用预备 hook（快照等，返回 None 只做旁路）
@@ -254,12 +290,36 @@ class SandboxGateway:
 
         results: dict[int, object] = {}
         if parallel:
-            with ThreadPoolExecutor(max_workers=min(self.config.agent.parallel_limit,
-                                                    len(parallel))) as pool:
+            # v0.4.29 P2：parallel_limit=0 时 min() 得 0 → ThreadPoolExecutor
+            # 抛 ValueError（整批工具调用失败）；max(1, …) 兜底
+            workers = max(1, min(int(self.config.agent.parallel_limit or 1),
+                                 len(parallel)))
+            # v0.4.30：不用 `with`（退出时 shutdown(wait=True) 仍会阻塞到
+            # 所有 worker 结束，"超时"形同虚设）；超时提示必须说明"后台可能
+            # 仍在执行、勿盲目重试"——否则模型重试会双重副作用
+            pool = ThreadPoolExecutor(max_workers=workers)
+            try:
                 futs = {pool.submit(self._safe_execute, c): i
                         for i, c in enumerate(calls) if c in parallel}
                 for fut, idx in futs.items():
-                    results[idx] = fut.result()
+                    timeout = max(1.0, float(getattr(calls[idx][1], "timeout", 60.0)))
+                    try:
+                        results[idx] = fut.result(timeout=timeout)
+                    except FuturesTimeoutError:
+                        fut.cancel()
+                        from axon.tools.registry import tool_result_err
+                        results[idx] = tool_result_err(
+                            calls[idx][0], "transient",
+                            f"工具执行超过 {timeout:.0f}s 未返回：**后台可能仍在"
+                            "执行，未经确认不要重试**（可能重复副作用）；"
+                            "可先检查产物或拆分任务")
+                    except Exception as e:  # noqa: BLE001 - worker 崩溃转观察
+                        from axon.tools.registry import tool_result_err
+                        results[idx] = tool_result_err(
+                            calls[idx][0], "transient",
+                            f"gateway: {type(e).__name__}: {e}")
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
         for i, c in enumerate(calls):
             if c in serial:
                 results[i] = self._safe_execute(c)

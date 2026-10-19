@@ -50,6 +50,8 @@ def _rows(con: sqlite3.Connection, table: str) -> list[dict]:
 
 
 def repair_database(db_path, schema: str, quarantine_dir=None) -> dict:
+    """v0.4.29：整体异常防护——"修复工具自己崩掉"与模块定位相悖，
+    任何未预期异常都转成 {"ok": False, "note": ...}。"""
     """修复数据库：备份坏库 → 重建 → 搬迁数据 → 校验。
 
     返回 {ok, backup, repaired, sessions, messages, audit, note}

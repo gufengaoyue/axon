@@ -20,6 +20,14 @@ def snapshot_file(path: Path, snapshots_dir: Path, session_id: str, turn: int,
         try:
             rel = path.resolve().relative_to(workspace.resolve())
             dest = snapshots_dir / session_id / str(turn) / rel
+            # v0.4.29：同回合二次编辑同一文件时旧快照才是"修改前原始内容"，
+            # 覆盖会丢失；已存在则加序号保留第一份
+            if dest.exists():
+                i = 2
+                base_dest = dest
+                while dest.exists():
+                    dest = base_dest.with_name(f"{base_dest.stem}-{i}{base_dest.suffix}")
+                    i += 1
         except ValueError:
             dest = snapshots_dir / session_id / str(turn) / ("_abs_" + path.name)
         dest.parent.mkdir(parents=True, exist_ok=True)

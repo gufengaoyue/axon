@@ -56,7 +56,7 @@ class InterjectReader:
         self._stop.set()
         t, self._thread = self._thread, None
         if t is not None:
-            t.join(timeout=0.5)
+            t.join(timeout=0.5)     # v0.4.29：等待线程真正退出（防 stop→start 并行 poll）
 
     # ---- 采集循环 ----
     def _loop(self) -> None:
@@ -94,12 +94,19 @@ class InterjectReader:
                 text = "".join(self.buffer).strip()
                 self.buffer.clear()
                 if text:
-                    self.queue.append(text[:_MAX_LEN])
+                    # v0.4.29：单一数据流——有 on_submit（CLI）时全走 bridge
+                    # （fallback 保证不丢）；旧实现同时 append queue + 走
+                    # bridge → openai 路轮次边界注入后，_settle 又看到
+                    # reader.queue 残留 → 同一插嘴被注入/确认两次
                     if self.on_submit is not None:
                         try:
-                            self.on_submit(text)
+                            self.on_submit(text[:_MAX_LEN])
                         except Exception:
-                            pass
+                            # v0.4.30：回调异常不得静默丢——回退队列由
+                            # _settle_interjections 兜底
+                            self.queue.append(text[:_MAX_LEN])
+                    else:
+                        self.queue.append(text[:_MAX_LEN])
                 return
             if ch == "\x08":                     # Backspace
                 if self.buffer:
@@ -152,11 +159,18 @@ class InterjectBridge:
     线程模型：`submit()` 在 InterjectReader 的键盘线程被调用（线程安全地
     `call_soon_threadsafe` 投递）；`get()` 在 provider 的 async 生成器里等待。
     未 bind（无事件循环）时 submit 静默失败——退化为"回合后确认"旧路径。
+
+    v0.4.29 P1 修复：openai 路没有 asyncio 循环，`submit()` 永远失败 →
+    插嘴文本永久丢失（用户看到"已提交"后内容消失）。现在 submit 失败时
+    把文本存入**线程安全 fallback 列表**，openai 路在轮次边界 `take_all()`
+    消费；codebuddy 路 bind 成功后走 asyncio.Queue。
     """
 
     def __init__(self):
         self.queue: "asyncio.Queue[str] | None" = None
         self._loop = None
+        self._fallback: list[str] = []          # v0.4.29：无 loop 时的落点
+        self._lock = threading.Lock()
 
     def bind(self, loop) -> None:
         import asyncio
@@ -166,16 +180,45 @@ class InterjectBridge:
     def reset(self) -> None:
         self.queue = None
         self._loop = None
+        with self._lock:
+            self._fallback.clear()
+
+    def reset_queue(self) -> None:
+        """清 asyncio 队列——v0.4.30：**先排水到 fallback**，否则 codebuddy 路
+        "最后一个消息边界之后、回合结束之前"到达的插嘴随队列对象丢弃
+        （既不注入也不进确认）。fallback 由 _settle_interjections 兜底。"""
+        q, self.queue = self.queue, None
+        self._loop = None
+        drained: list[str] = []
+        if q is not None:
+            try:
+                while True:
+                    drained.append(q.get_nowait())
+            except Exception:       # noqa: BLE001 - QueueEmpty / 已关闭
+                pass
+        if drained:
+            with self._lock:
+                self._fallback[0:0] = drained
 
     def submit(self, text: str) -> bool:
         """键盘线程调用：把插嘴投递到队列（返回是否成功入队）。"""
-        if self.queue is None or self._loop is None:
-            return False
-        try:
-            self._loop.call_soon_threadsafe(self.queue.put_nowait, text)
-            return True
-        except RuntimeError:
-            return False
+        if self.queue is not None and self._loop is not None:
+            try:
+                self._loop.call_soon_threadsafe(self.queue.put_nowait, text)
+                return True
+            except RuntimeError:
+                pass
+        # v0.4.29：无 loop（openai 路）/loop 已关闭 → 存 fallback 供轮次边界消费
+        with self._lock:
+            self._fallback.append(text)
+        return True
+
+    def take_all(self) -> list[str]:
+        """取走并清空 fallback 残留（openai 路轮次边界消费用；v0.4.29）。"""
+        with self._lock:
+            items = list(self._fallback)
+            self._fallback.clear()
+        return items
 
     async def get(self, timeout: float = 0.4):
         """async 侧等待一条插嘴；超时/空返回 None（让出控制权，保持流活跃）。

@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/gufengaoyue/axon"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-gufengaoyue%2Faxon-181717?logo=github"></a>
   <a href="https://pypi.org/project/ai-agent-axon/"><img alt="PyPI" src="https://img.shields.io/badge/PyPI-ai--agent--axon-3775A9?logo=pypi&logoColor=white"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.4.28-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.30-blue">
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -69,6 +69,7 @@ Axon 是一个**在你的电脑上本地运行**的 AI 智能体。它不是一�
 | ⏹️ **中断即停** | Ctrl+C 中断的回合**不触发沉淀**（旧实现在中断后又开一个沉淀回合、继承毒上下文再次陷循环——用户实测“停了还在想”）；沉淀提示词显式隔离历史观察消息；L1 信号源改本回合增量消息（corrected 不再恒真） |
 | 🧹 **状态行无残影** | 双行状态行**默认关闭**（占位/上移重绘与流式输出、思考框互相干扰，实测“正在执行…”残行停住 (0s) 不消失）；改单行 `\r` 同行重写（无占位无上移）；底部工具栏常驻等价提示；`agent.two_line_status: true` 可开回（占位重复 bug 已修） |
 | 💭 **思考可回顾** | 思考仍以滚动窗显示（不霸屏），同时全文存档 `<数据目录>/thinking/<会话>.log`；`/think [n|all]` 随时回顾（收起=默认滚动，展开=/think 读档），长内容折叠、Ctrl+O 全显 |
+| 🔒 **全量审计加固** | v0.4.29–v0.4.30 两轮全面审计（含对修复本身的复审）：解释器写路径提取（shutil/rename/mkdir）+ 动态目标 fail-closed、`%VAR%`/`${HOME}`/`!VAR!` 绕过封堵、Windows 开关/复合删除命令/引号路径解析、CRLF 编辑闭环、非 UTF-8 字节保护、授权缓存粒度、压缩摘要不叠加、规则 2 反复被拒判负、插嘴全链路（bind/fallback/边界残留）、资源生命周期收口 |
 
 ---
 

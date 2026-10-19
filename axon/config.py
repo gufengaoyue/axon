@@ -418,8 +418,7 @@ class AXONConfig:
     @property
     def venv_dir(self) -> Path:
         """程序级共享虚拟环境（所有项目共用，v0.4.4 落地设计承诺）。"""
-        return strip_root_prefix(Path.home().joinpath()) if False else \
-            (program_root() / "venv")
+        return program_root() / "venv"
 
     @property
     def venv_python(self) -> Path:
@@ -550,8 +549,11 @@ def resolve_api_key(spec: str | None) -> str | None:
 _PROVIDER_DEFAULTS = {
     "codebuddy": {"env_api_key": "CODEBUDDY_API_KEY",
                   "env_environment": "CODEBUDDY_INTERNET_ENVIRONMENT"},
+    # v0.4.30：与 ProviderCfg 默认一致——尊重 OPENAI_BASE_URL 环境变量
+    # （旧实现硬编码 api.openai.com，静默丢弃用户配置的中转端点）
     "openai": {"env_api_key": "OPENAI_API_KEY",
-               "base_url": "https://api.openai.com/v1"},
+               "base_url": os.environ.get("OPENAI_BASE_URL")
+               or "https://api.openai.com/v1"},
 }
 
 
@@ -620,6 +622,14 @@ def load_config(path: str | Path | None = None,
         base = cfg_path.resolve().parent
 
     if overrides:
+        # v0.4.30：YAML 里 `model:` / `providers:` / `agent:` 留空（null）时
+        # setdefault 返回 None → 后续 .get/setdefault 抛 AttributeError/
+        # TypeError，且只有带 CLI 覆盖时才触发
+        for _sec in ("model", "agent"):
+            if raw.get(_sec) is None:
+                raw[_sec] = {}
+        if (raw.get("model") or {}).get("providers") is None:
+            raw.setdefault("model", {})["providers"] = {}
         for key in ("workspace", "project"):
             if overrides.get(key):
                 raw[key] = overrides[key]
@@ -807,8 +817,9 @@ def _validate(cfg: AXONConfig) -> None:
     for r in cfg.sandbox.paths:
         if r.mode not in ("allow", "ask", "deny"):
             raise ValueError(f"path rule mode 非法: {r.mode}")
-    for mode in ("green_auto", "yellow_notify", "red_confirm", "black_block"):
-        pass
+    # v0.4.29：删除空循环（旧实现 `for mode in (...): pass`——疑似风控校验
+    # 未写完，给人"已校验"的错觉）；risk_grading 的四档键由 dataclass 默认
+    # 保证存在，未知键在网关侧按"未命中"处理
     if cfg.sandbox.approval_granularity not in ("prefix", "exact"):
         raise ValueError("approval_granularity 必须是 prefix 或 exact")
 

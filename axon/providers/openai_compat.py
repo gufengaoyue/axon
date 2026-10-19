@@ -103,6 +103,10 @@ class OpenAICompatProvider:
                 args = json.loads(a["args"]) if a["args"] else {}
             except json.JSONDecodeError:
                 args = {"_raw": a["args"]}
+            # v0.4.29 P1：合法 JSON 但非对象（"[1,2]"/"\"s\""/null）→ 下游
+            # args.get() 会 AttributeError 崩在网关保险之前（裸 traceback）
+            if not isinstance(args, dict):
+                args = {"_raw": a["args"]}
             yield StreamEvent(kind="tool_call", tool_call=ToolCall(
                 id=a["id"] or f"call_{idx}", name=a["name"], arguments=args))
         yield StreamEvent(kind="done")

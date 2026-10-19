@@ -72,4 +72,7 @@ def test_submit_source_marks_committed_and_warns():
 def test_bridge_submit_false_when_unbound():
     from axon.interject import InterjectBridge
     b = InterjectBridge()
-    assert b.submit("x") is False                    # 未绑定 → 上层给出警告
+    # v0.4.29：未绑定不再静默失败——存入 fallback（openai 路轮次边界
+    # take_all 消费），插嘴不再永久丢失；take_all 可取回
+    assert b.submit("x") is True
+    assert b.take_all() == ["x"]

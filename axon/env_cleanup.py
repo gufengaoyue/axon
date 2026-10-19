@@ -76,11 +76,16 @@ def cleanup_temp(config, extra_patterns: list[str] | None = None) -> list[str]:
     if extra_patterns:
         patterns.extend(extra_patterns)
     ws = Path(config.workspace)
-    protected = (ws / "tmp").resolve()
+    # v0.4.29：downloads/ 也受保护——模块 docstring 承诺"下载物不动"，
+    # 旧实现只保护 tmp，下载目录里的 *.bak/~$*/Thumbs.db 会被每回合清掉
+    _dl = str(getattr(config.tools, "downloads_dir", "") or "")
+    protected = {(ws / "tmp").resolve()}
+    if _dl and _dl.lower() not in ("none", "null"):
+        protected.add((ws / _dl).resolve())
     for p in _iter_temp_files(ws, patterns):
         try:
-            if protected in p.resolve().parents or p.resolve() == protected:
-                continue                    # 附件/临时目录受保护（v0.2.5）
+            if any(pr in p.resolve().parents or p.resolve() == pr for pr in protected):
+                continue                    # 附件/临时/下载目录受保护（v0.2.5 / v0.4.29）
             p.unlink()
             removed.append(str(p))
         except OSError:

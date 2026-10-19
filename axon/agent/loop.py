@@ -61,7 +61,12 @@ class StuckDetector:
 
 
 class NullStatus:
-    """无 UI 时的状态桩（库调用/测试用）。"""
+    """无 UI 时的状态桩（库调用/测试用）。
+
+    v0.4.29：补齐 StatusLine 的被调方法——codebuddy 路插嘴分支调
+    `status.ensure_newline()`，NullStatus 缺该方法会 AttributeError
+    （被 except 转成 provider_error，库调用路径莫名其妙失败）。
+    """
 
     def thinking(self, note: str = "") -> None:
         pass
@@ -79,6 +84,12 @@ class NullStatus:
         pass
 
     def idle(self) -> None:
+        pass
+
+    def ensure_newline(self) -> None:
+        pass
+
+    def bump(self) -> None:
         pass
 
 
@@ -117,7 +128,23 @@ class AgentLoop:
 
 
     def _post_turn(self, session, result: TurnResult, user_input: str = "") -> None:
-        """回合收尾：① 持久化未完成任务（v0.2.5）② 清理临时文件 ③ 产物 ④ 进度日志。"""
+        """回合收尾：① 产物收集与归档 ② 持久化未完成任务 ③ 清理临时文件
+        ④ 验收自检 ⑤ 进度日志。
+
+        v0.4.29 P1：产物收集必须**先于** _persist_unfinished——后者追加的
+        <interrupted_task> 是 user 消息，而 _collect_products 以"最后一条
+        user 消息"定位本回合，旧顺序下 interrupted_task 成为最后 user 消息
+        → 中断回合产物恒空（工具已干活却不归档、页脚无产物、自检误报）。
+        """
+        try:
+            result.products = self._collect_products(session)
+        except Exception:
+            result.products = []
+        archived: list[tuple[str, str]] = []
+        try:
+            archived = self._archive_products(result)
+        except Exception:
+            archived = []
         try:
             self._persist_unfinished(session, result, user_input)
         except Exception:
@@ -136,15 +163,6 @@ class AgentLoop:
                         "allow", "cleanup:temp", "ok")
         except Exception:
             cleaned = []
-        try:
-            result.products = self._collect_products(session)
-        except Exception:
-            result.products = []
-        archived: list[tuple[str, str]] = []
-        try:
-            archived = self._archive_products(result)
-        except Exception:
-            archived = []
         try:                                   # 任务级验收自检（v0.4.2）
             from axon.agent.verify import acceptance_check
             result.acceptance = acceptance_check(user_input or "", result, self.config)
@@ -251,9 +269,15 @@ class AgentLoop:
         from axon.agent.msgmeta import unpack_meta
         import os as _os
         messages = self.store.load_messages(session.id)
+        # v0.4.30：跳过系统观察消息（<user_interjection>/<verification_failed>/
+        # <interrupted_task> 等也是 user 角色）——旧实现取"最后一条 user"，
+        # 插嘴注入后产物定位失效（产物恒空、不归档、自检误报）
+        _INTERNAL = ("<user_interjection>", "<verification_failed>",
+                     "<interrupted_task>", "<resume_context>",
+                     "<tool_name_hint>", "<conversation_summary>")
         start = 0
         for i, m in enumerate(messages):
-            if m.role == "user":
+            if m.role == "user" and not str(m.content or "").startswith(_INTERNAL):
                 start = i
         out: list[dict] = []
         seen: set[str] = set()
@@ -325,6 +349,16 @@ class AgentLoop:
         try:
             while turns < self.config.agent.max_turns:
                 turns += 1
+                # v0.4.29 P1：openai 路插嘴消费——bridge fallback（旧实现
+                # bind 在同步线程必失败 → interject=None → 插嘴永久丢失）。
+                # 在每个轮次边界（下一个模型动作前）注入，语义与 codebuddy
+                # 路的 interrupt 重发对齐。
+                if interject is not None:
+                    from axon.interject import wrap_interjection as _wrap_ij
+                    for ij in interject.take_all():
+                        self.store.append_message(session.id, Message(
+                            role="user", content=_wrap_ij(ij)))
+                        self.status.note("💬 插嘴已送达，智能体重新规划中…")
                 # ---- 组装（超 90% → 强制压缩后重组装） ----
                 history = self.store.load_messages(session.id)
                 try:
@@ -332,7 +366,17 @@ class AgentLoop:
                 except CompactionNeeded:
                     self.compactor.compact(session.id, history, self._summarize, self.store)
                     history = self.store.load_messages(session.id)
-                    ctx = self.ctx_builder.assemble(session, history)
+                    # v0.4.29 P1：压缩后第二次 assemble 仍可能超限（保护区
+                    # 自身就大 / old_part 为空）→ 旧实现直接抛穿 run()。现在
+                    # 包一层：再失败以 budget_exhausted 可操作结论收尾。
+                    try:
+                        ctx = self.ctx_builder.assemble(session, history)
+                    except CompactionNeeded:
+                        return TurnResult(
+                            "", "budget_exhausted", turns, tokens_used,
+                            self._side_effects(session),
+                            note="上下文压缩后仍超限（单条消息过大或保护区内"
+                                 "容超预算），请开新会话或调大 context_window")
                 # 80% 水位清理（记 warn 失效账）
                 if ctx.tokens_est >= self.config.context.compact_warn_ratio * \
                         self.config.model.context_window:
@@ -460,6 +504,10 @@ class AgentLoop:
                     # 判负 → 无限追加 <verification_failed> → 模型自证死循环
                     # （用户实测：换方法成功后仍无法结题，只能重启会话）
                     stuck_fired = False
+                # v0.4.29：有工具执行的轮次重置熔断计数——"连续 2 次验证失败"
+                # 的语义是终答连续失败，中间干活的轮次不算（旧实现累计计数，
+                # 长任务可能因早期两次失败被误熔断）
+                vf_count = 0
 
                 # ---- 预算闸 ----
                 if tokens_used > self.config.model.session_token_budget:
@@ -563,6 +611,11 @@ def _friendly_provider_error(exc: BaseException, cfg, model: str = "") -> str:
                     "是否拼错")
     elif name == "RateLimitError":
         tail.append("触发限额（429）。稍后重试，或到服务商控制台检查额度")
+    elif name == "PermissionDeniedError":
+        tail.append("无权限（403）。请检查账户状态、密钥权限与服务商的"
+                    "地域/模型开通情况（欠费或未开通该模型也会报 403）")
+    elif name == "InternalServerError":
+        tail.append("服务端内部错误（500）。稍后重试；持续失败请联系服务商")
     elif name == "BadRequestError":
         tail.append("请求被拒绝（400）。常见于模型名不被该端点支持、参数越界"
                     "（max_tokens 超上限）、或多模态格式不被支持")

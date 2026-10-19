@@ -139,7 +139,7 @@ def build_system_prompt(config: "AXONConfig") -> str:
 # 工具使用
 - 编辑文件用 edit_file（old_string 必须唯一匹配）；大文件先 read_file 定位再改。
 - 修改文件前系统会自动快照；写操作后如收到回读校验失败，应重新读取并修正。
-- shell 命令的工作目录是工作空间；脚本请使用工作空间内的隔离环境（如 {ws}/.venv）。
+- shell 命令的工作目录是工作空间；脚本一律用上文「Python 环境」给出的**程序级共享 venv**，不要在工作空间另建 .venv。
 
 # 回复风格
 - 简洁、直接、结构化；先给结论再给依据。

@@ -49,4 +49,7 @@ def estimate_messages_tokens(messages: list) -> int:
             total += estimate_tokens(content)
         for tc in getattr(m, "tool_calls", None) or []:
             total += estimate_tokens(tc.name) + estimate_tokens(str(tc.arguments))
+        # v0.4.29：图片计入估值（每张约 1000 token 的保守估计）——旧实现
+        # 完全不计，大图会让压缩触发延迟、请求超限
+        total += 1000 * len(getattr(m, "images", None) or [])
     return total

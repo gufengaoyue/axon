@@ -68,10 +68,20 @@ class GlobalMemoryStore:
             pass
 
     def read(self) -> str:
+        """读文件。v0.4.29：解码失败**抛错**而非返回空串——旧实现返回 ""
+        会让 append 误判"空文件"并以空 body 全量覆写，非 UTF-8 损坏的记忆
+        被静默清空。"""
         try:
             return io.open(self.path, encoding="utf-8").read()
-        except (OSError, UnicodeDecodeError):
-            return ""
+        except FileNotFoundError:
+            return ""              # 尚未创建 → 空文件语义正确
+        except OSError as e:
+            # v0.4.30：其它读失败（共享冲突/权限）不得返回空串——旧实现会让
+            # append 误判"空文件"并以空 body 全量覆写
+            raise ValueError(f"长期记忆文件读取失败（{e}）：{self.path}")
+        except UnicodeDecodeError as e:
+            raise ValueError(
+                f"长期记忆文件编码损坏（{e}）：{self.path}——请用 UTF-8 保存或手工修复")
 
     # ---- 注入 ----
     def render_block(self) -> str:

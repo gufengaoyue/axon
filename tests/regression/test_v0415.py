@@ -25,7 +25,10 @@ def test_bridge_submit_and_get():
         got = await bridge.get(timeout=1.0)
         assert got == "补充一句"
         bridge.reset()
-        assert bridge.submit("x") is False            # 未绑定 → 静默失败
+        # v0.4.29：未绑定（reset 后）不再静默失败丢弃——存入 fallback，
+        # openai 路在轮次边界 take_all() 消费（插嘴永久丢失的修复）
+        assert bridge.submit("x") is True
+        assert bridge.take_all() == ["x"]
 
     asyncio.run(main())
 
@@ -95,14 +98,34 @@ def test_reader_submit_callback_fires():
 
 
 def test_settle_skips_when_stream_on(cfg):
-    """stream_interject 开启时，回合结束不再弹确认（插嘴已即时注入）。"""
+    """stream_interject 开启时，无残留不弹确认（插嘴已即时注入）。
+
+    v0.4.29：有边界残留时会弹确认（旧实现直接 return → 残留丢失）。
+    """
     from unittest.mock import MagicMock
     from axon import cli
     app = {"keyboard": MagicMock(), "console": None, "cfg": cfg}
     kb = app["keyboard"]
-    kb.has_pending.return_value = True          # 即使有残留也不弹
+    kb.has_pending.return_value = False         # 无残留 → 不弹确认
     cli._settle_interjections(app, None)
-    kb.pop_all.assert_not_called()              # 没有走旧确认路径
+    kb.pop_all.assert_not_called()
+
+
+def test_settle_confirms_residual_when_stream_on(cfg, monkeypatch):
+    """v0.4.29：stream_on 时的边界残留 → 弹确认注入（不再静默丢弃）。"""
+    from unittest.mock import MagicMock
+    from axon import cli
+    app = {"keyboard": MagicMock(), "console": None, "cfg": cfg,
+           "interject_bridge": None}
+    kb = app["keyboard"]
+    kb.has_pending.side_effect = [True, False]      # 一轮后清空
+    kb.pop_all.return_value = "边界插嘴"
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+    sent = []
+    monkeypatch.setattr(cli, "_run_turn",
+                        lambda *a, **k: sent.append(a[2]))
+    cli._settle_interjections(app, None)
+    assert sent and "边界插嘴" in sent[0]
 
 
 def test_config_stream_interject_default(cfg):

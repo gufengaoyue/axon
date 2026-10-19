@@ -122,8 +122,12 @@ _INTERP_SHELL_RE = re.compile(
 _INTERP_DYNEXEC_RE = re.compile(r"\b(?:eval|exec|compile)\s*\(")
 _INTERP_SYSMUT_RE = re.compile(
     r"\b(?:os\.chmod|os\.chown|os\.rename|shutil\.move|shutil\.copy[a-z]*"
-    r"|os\.mkdir|os\.makedirs|\.write_text|\.write_bytes|os\.symlink)\b"
-    r"|open\s*\([^)]*['\"][wax]")
+    r"|os\.mkdir|os\.makedirs|os\.symlink|os\.link)\b"
+    r"|\.\s*write_(?:text|bytes)\s*\("          # v0.4.29：从 \b 组中移出——
+    r"|writeFileSync\s*\("                     # `Path('x').write_text` 前一字符是
+    # v0.4.30：写 mode 必须**显式出现在括号内**（旧 `[^)]*['\"][wax]` 会把
+    # open('x') / open('a.csv') 误判为写——引号后首字母即命中）
+    r"|open\s*\([^)]*,\s*['\"][wax][bra+]*['\"]")
 # 删除调用的字面量参数（用于计数与路径提取）：os.remove('a.txt') / Path('x').unlink()
 _INTERP_DELETE_LITERAL_RE = re.compile(
     r"(?:os\.remove|os\.unlink|os\.rmdir|\.unlink|\.rmdir|send2trash)\s*\(\s*"
@@ -133,12 +137,29 @@ _INTERP_DELETE_LITERAL2_RE = re.compile(
 # 动态目标（变量/glob/循环）→ 不可静态计数
 _INTERP_DYNTARGET_RE = re.compile(r"\b(?:glob\.|Path\([^)]*\)\.glob|rglob|iterdir"
                                   r"|os\.walk|listdir)\b")
+# 解释器**写**调用的字面量路径（v0.4.29 P0 修复：旧实现对解释器 file_write
+# 不提取路径 → a.paths 恒空 → deny/盘根/程序目录检查全部跳过 → 任意位置可写）
+#   open('x.txt','w') / open('x','a') / open('x','x')
+#   Path('x').write_text(...) / .write_bytes(...)
+#   node: fs.writeFileSync('x', ...) / require('fs').writeFileSync('x', ...)
+_INTERP_WRITE_OPEN_RE = re.compile(
+    r"open\s*\(\s*(['\"])(.+?)\1\s*,\s*['\"][wax]")
+_INTERP_WRITE_METHOD_RE = re.compile(
+    r"\.\s*write_(?:text|bytes)\s*\(\s*|\.\s*write_text\s*\(\s*(['\"])(.+?)\1")
+_INTERP_WRITE_NODE_RE = re.compile(
+    r"(?:fs\.writeFileSync|writeFileSync)\s*\(\s*(['\"])(.+?)\1")
 
 # 重定向：>nul / 2>&1 / >/dev/null 不算写文件
 _REDIR_CLEAN = re.compile(r"\d*>&\d*|\d*>>?\s*(?:nul|/dev/null)", re.IGNORECASE)
 _REDIR_TARGET = re.compile(r">>?\s*([^\s|&;>\"]+)")
 _PATH_RE = re.compile(r"^([A-Za-z]:[\\/]|\\\\|/|~)")
 _WILDCARD_RE = re.compile(r"[*?\[]")
+# v0.4.29 P0：cmd 的 %VAR% 与 PowerShell 的 $env:VAR（均会被壳真实展开）
+# v0.4.30：放宽——子串/替换形态 %VAR:~0,2%、%VAR:a=b%、!VAR!（delayed
+# expansion）、${VAR} 同样会被壳展开；token 里出现这些记号即视为不可静态判定
+# （不要求成对闭合，否则可绕过）
+_ENV_VAR_RE = re.compile(
+    r"%[^%\s]{1,64}%|\$env:[A-Za-z_]|\$\{[A-Za-z_]|![A-Za-z_][A-Za-z0-9_]*!")
 
 
 # ---------------------------------------------------------------- 数据结构
@@ -160,6 +181,7 @@ class CmdAnalysis:
     atoms: list[Atom] = field(default_factory=list)
     base: str = ""
     interp_only_write: bool = False    # 变更仅来自解释器代码（无危险信号）
+    interp_write_dynamic: bool = False # v0.4.29：解释器写目标含变量/glob（不可静态判定）
     interp_deletes: list[str] = field(default_factory=list)
 
 
@@ -314,6 +336,17 @@ def analyze(cmd: str, workspace) -> CmdAnalysis:
     delete_count = 0
     saw_delete = False
     unbounded_delete = False
+    # v0.4.29 P0：`%VAR%`（cmd 批处理）与 `$env:VAR`（PowerShell）也会被真实
+    # 展开——旧实现只查 `$(`/反引号，导致 `type %USERPROFILE%\.ssh\id_rsa`
+    # 判 read_only 且路径是字面量 → 绕过 deny 表（读的默认放行使它成为
+    # 数据外泄通道）。**只拦路径形态 token 内的变量**（含路径分隔符）——
+    # `echo "EXIT %errorlevel%"` 这类无害回显不误伤（用户实测高频模式）。
+    for tok in cmd.split():
+        if _ENV_VAR_RE.search(tok) and ("/" in tok or "\\" in tok
+                                        or _PATH_RE.match(tok)):
+            a.has_substitution = True
+            a.kind = "unknown"
+            return a
 
     for atom_raw in _split_atoms(cmd):
         toks = _tokenize(atom_raw)
@@ -387,7 +420,12 @@ def analyze(cmd: str, workspace) -> CmdAnalysis:
                     delete_count += cnt
                     a.interp_deletes.extend(dps)
             elif kind == "file_write":
-                a.interp_only_write = True
+                # v0.4.29 P0：提取代码内的写路径（旧实现不提 → 任意位置可写）
+                code = _interp_code(prog, args, base, workspace) or ""
+                saw_w, wpaths, wdyn = _interp_write_info(code, base, workspace)
+                a.interp_only_write = saw_w
+                a.interp_write_dynamic = wdyn
+                a.paths.extend(wpaths)
             continue
 
         if kind == "delete":
@@ -462,7 +500,9 @@ def _resolve_one(t: str, base: Path, workspace: Path) -> str | None:
         p = base / p
     try:
         return str(Path(os.path.realpath(str(p))))
-    except OSError:
+    except (OSError, ValueError):
+        # v0.4.29：含 NUL 字节的路径 realpath 抛 ValueError（embedded null byte）
+        # 会穿透 hook 管线；返回原串交由后续判定
         return str(p)
 
 
@@ -549,6 +589,77 @@ def _interp_code(prog: str, args: list[str], base: Path | None,
             return None
         return None                         # 脚本不存在/过大 → 不透明
     return ""                               # 无参数（如 `python`）→ 交互式，按安全处理
+
+
+# 解释器**写**调用的字面量路径（v0.4.29 P0 修复：旧实现对解释器 file_write
+# 不提取路径 → a.paths 恒空 → deny/盘根/程序目录检查全部跳过 → 任意位置可写）
+#   open('x.txt','w') / open('x','a') / open('x','x')          → 第一参数字面量
+#   fs.writeFileSync('x', data)（node -e）                      → 第一参数字面量
+#   Path('x').write_text(...)                                   → Path 构造字面量
+#   （.write_text 的目标是变量时无法静态提取 → 走动态判定 ask）
+# v0.4.30：字面量用有界字符类（`(.+?)` 在大脚本上二次回溯——实测 23KB
+# 单行 570ms，_interp_code 上限 512KB 可外推数分钟，且发生在 hook 同步路径）
+_INTERP_WRITE_OPEN_RE = re.compile(
+    r"open\s*\(\s*(['\"])([^'\"\n]{0,4096})\1\s*,\s*['\"][wax]")
+_INTERP_WRITE_NODE_RE = re.compile(
+    r"writeFileSync\s*\(\s*(['\"])([^'\"\n]{0,4096})\1")
+_INTERP_WRITE_PATHCTOR_RE = re.compile(
+    r"Path\s*\(\s*(['\"])([^'\"\n]{0,4096})\1\s*\)")
+# 写调用形态计数：只数**带写 mode** 的 open（读 open 不算）+ writeFileSync
+_INTERP_WRITE_CALL_RE = re.compile(
+    r"open\s*\([^)]*,\s*['\"][wax][bra+]*['\"]|writeFileSync\s*\(")
+# v0.4.30：shutil.copy/move、os.rename/replace、os.link/symlink 的**目标**实参
+# （第 2 个）；os.mkdir/makedirs 的唯一实参。旧实现只提取 open/writeFileSync/
+# Path()，这几类 saw_write=True 但 paths=[] → interp_safe 放行（任意位置可写）
+_INTERP_SHUTIL_DST_RE = re.compile(
+    r"(?:shutil\.(?:copy[0-9a-z]*|move)|os\.rename|os\.replace"
+    r"|os\.link|os\.symlink)\s*\(\s*(['\"])([^'\"\n]{0,4096})\1\s*,"
+    r"\s*(['\"])([^'\"\n]{0,4096})\3")
+_INTERP_MKDIR_RE = re.compile(
+    r"(?:os\.mkdir|os\.makedirs)\s*\(\s*(['\"])([^'\"\n]{0,4096})\1")
+
+
+def _interp_write_info(code: str, base: Path,
+                       workspace: Path) -> tuple[bool, list[str], bool]:
+    """从解释器代码提取写操作：返回 (是否含写, 字面量路径表, 是否有动态目标)。
+
+    动态目标（变量/glob 作写目标）→ 第三项 True，调用方按 fail-closed 升级审批
+    （v0.4.29：旧实现把解释器 file_write 一律放行，等于放弃路径校验）。
+    """
+    saw_write = bool(_INTERP_SYSMUT_RE.search(code))
+    literals: list[str] = []
+    for m in _INTERP_WRITE_OPEN_RE.finditer(code):
+        literals.append(m.group(2))
+    for m in _INTERP_WRITE_NODE_RE.finditer(code):
+        literals.append(m.group(2))
+    n_dst = 0
+    for m in _INTERP_SHUTIL_DST_RE.finditer(code):
+        literals.append(m.group(4))       # 目标（第 2 实参）——copy/move/rename
+        n_dst += 1
+    n_mk = 0
+    for m in _INTERP_MKDIR_RE.finditer(code):
+        literals.append(m.group(2))
+        n_mk += 1
+    if _INTERP_DYNTARGET_RE.search(code):
+        return saw_write, [], True
+    # 写调用数 > 可提取字面量数 → 存在非字面量目标（变量路径）。
+    # v0.4.30：动态时返回**空表 + True**（旧实现返回未解析字面量，hook 又
+    # 只在 paths 为空时才看 dynamic → 混合写漏检）
+    n_write_calls = (len(_INTERP_WRITE_CALL_RE.findall(code)) + n_dst + n_mk)
+    if n_write_calls > len(literals) or (saw_write and not literals):
+        return saw_write, [], True
+    # Path('x') 构造（write_text/write_bytes 的常见目标形态）——宽松提取，
+    # 多提取只会多过检查（fail-closed 方向）
+    if saw_write and not literals:
+        for m in _INTERP_WRITE_PATHCTOR_RE.finditer(code):
+            literals.append(m.group(2))
+    paths: list[str] = []
+    for lit in literals:
+        p = Path(lit)
+        if not p.is_absolute():
+            p = base / p
+        paths.append(str(Path(os.path.realpath(str(p)))))
+    return saw_write, paths, False
 
 
 def _interp_delete_info(code: str, base: Path,
@@ -673,21 +784,7 @@ def _looks_like_path(t: str) -> bool:
     return bool(_PATH_RE.match(t)) or "\\" in t or "/" in t
 
 
-def _extract_paths(args: list[str], base: Path, workspace: Path) -> list[str]:
-    out = []
-    for t in args:
-        if not _looks_like_path(t):
-            continue
-        if _WILDCARD_RE.search(t):
-            # glob 展开（相对 base），最多 1000 个
-            pat = t if os.path.isabs(t) else str(base / t)
-            hits = _glob.glob(pat, recursive=True)
-            out.extend(hits[:1000])
-            continue
-        r = _resolve_one(t, base, workspace)
-        if r:
-            out.append(r)
-    return out
+# v0.4.29：删除死代码 _extract_paths（全仓无调用；路径提取已内联在 analyze 各分支）
 
 
 def _count_delete(args: list[str], base: Path, workspace: Path,
@@ -817,7 +914,12 @@ class CommandRuleHook:
                             "删除信任区外的路径，需审批")
 
         if a.kind == "file_write":
-            # 解释器代码内的写操作（无删除/无 shell 逃逸，cwd=工作空间）→ 放行
+            # v0.4.30：动态写目标判定**必须前置**——旧实现只在 paths 为空时
+            # 才看 dynamic，混合写（一个字面量 + 一个变量目标）会走
+            # workspace_full 直接放行
+            if a.interp_only_write and getattr(a, "interp_write_dynamic", False):
+                return Decision("ask", "command:interp_write_dynamic",
+                                "解释器代码内的写目标不可静态判定（变量/遍历），需审批")
             if a.interp_only_write and not a.paths:
                 return Decision("allow", "command:interp_safe",
                                 "解释器脚本内的文件操作（无危险信号，cwd=工作空间）")

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS messages (
   tool_call_id TEXT,
   name TEXT,
   tokens_est INTEGER,
+  images TEXT,                      -- v0.4.29：图片路径 JSON（多轮图片上下文）
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
@@ -100,9 +101,14 @@ def _warn_if_damaged(con: sqlite3.Connection, db_path) -> None:
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
+    # v0.4.30：PRAGMA 容错——坏库在 journal_mode=WAL 处就抛
+    # `DatabaseError: file is not a database`，走不到 quick_check 与修复指引
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except sqlite3.DatabaseError:
+        pass
     conn.row_factory = sqlite3.Row
     _warn_if_damaged(conn, db_path)        # v0.4.3：首次连接做完整性自检
     return conn
@@ -133,8 +139,15 @@ def _row_to_message(r: sqlite3.Row) -> Message:
         from axon.providers.base import ToolCall
         for tc in json.loads(r["tool_calls"]):
             tcs.append(ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"]))
+    images: list[str] = []
+    try:                                   # v0.4.29：老库无 images 列 → KeyError 兜底
+        if r["images"]:
+            images = json.loads(r["images"])
+    except (IndexError, KeyError, ValueError):
+        images = []
     return Message(role=r["role"], content=r["content"], tool_calls=tcs,
-                   tool_call_id=r["tool_call_id"], name=r["name"], turn=r["turn"])
+                   tool_call_id=r["tool_call_id"], name=r["name"], turn=r["turn"],
+                   images=images)
 
 
 class SessionStore:
@@ -144,15 +157,34 @@ class SessionStore:
         self.conn = conn
         self._lock = __import__("threading").Lock()
         with self._lock:
-            self.conn.executescript(SCHEMA)
-            self._ensure_columns()
-            self.conn.commit()
+            # v0.4.29 P1：只读降级（库损坏时 connect 置了 query_only）下
+            # executescript 也会抛 OperationalError → 启动崩栈，"只读降级"
+            # 承诺从未真正生效。现在捕获并跳过初始化（后续写操作会失败，
+            # 但至少启动不崩，用户能看到修复指引）。
+            try:
+                self.conn.executescript(SCHEMA)
+                self._ensure_columns()
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                # v0.4.30：只读降级（query_only）跳过初始化；**非只读**的
+                # schema 错误必须重抛（否则后续 create_session 报 no such table）
+                try:
+                    ro = self.conn.execute("PRAGMA query_only").fetchone()[0]
+                except sqlite3.Error:
+                    ro = 0
+                if not ro:
+                    raise
 
     def _ensure_columns(self) -> None:
-        """轻量迁移：老库补列（v0.1.1 新增 sdk_session_id）。"""
+        """轻量迁移：老库补列（v0.1.1 新增 sdk_session_id；v0.4.29 新增 images）。"""
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(sessions)").fetchall()}
         if "sdk_session_id" not in cols:
             self.conn.execute("ALTER TABLE sessions ADD COLUMN sdk_session_id TEXT")
+        mcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if mcols and "images" not in mcols:
+            # v0.4.29：多轮图片上下文——旧表无 images 列，openai 路第 2 轮起
+            # 图片从历史消失（静默丢失）。补列 + append/load 支持（见下）。
+            self.conn.execute("ALTER TABLE messages ADD COLUMN images TEXT")
 
     # ---- 会话 ----
     def create_session(self, project_dir: str, provider: str, model: str,
@@ -307,21 +339,23 @@ class SessionStore:
 
     # ---- 消息 ----
     def append_message(self, session_id: str, msg: Message) -> Message:
-        turn = self.next_turn(session_id)
-        msg.turn = turn
+        # v0.4.29：next_turn 挪进锁内——旧实现锁外计算，并发 append 可撞 turn
         import json
         tcs = json.dumps([{"id": t.id, "name": t.name, "arguments": t.arguments}
                           for t in msg.tool_calls], ensure_ascii=False) if msg.tool_calls else None
+        imgs = json.dumps(list(msg.images), ensure_ascii=False) if getattr(msg, "images", None) else None
         msg.tokens_est = estimate_messages_tokens([msg])
         if msg.role == "user" and msg.content:
             self._auto_title(session_id, msg.content)
         with self._lock:
+            turn = self.next_turn(session_id)
+            msg.turn = turn
             self.conn.execute(
                 "INSERT INTO messages (session_id, turn, role, content, tool_calls,"
-                " tool_call_id, name, tokens_est, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                " tool_call_id, name, tokens_est, images, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (session_id, turn, msg.role, msg.content, tcs, msg.tool_call_id,
-                 msg.name, msg.tokens_est, _utcnow()))
+                 msg.name, msg.tokens_est, imgs, _utcnow()))
             self.conn.commit()
         return msg
 
@@ -351,14 +385,18 @@ class SessionStore:
         with self._lock:
             self.conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             for m in new_messages:
+                imgs = __import__("json").dumps(
+                    list(getattr(m, "images", []) or []), ensure_ascii=False) \
+                    if getattr(m, "images", None) else None
                 self.conn.execute(
                     "INSERT INTO messages (session_id, turn, role, content, tool_calls,"
-                    " tool_call_id, name, tokens_est, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    " tool_call_id, name, tokens_est, images, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (session_id, m.turn or 0, m.role, m.content,
                      __import__("json").dumps(
                          [{"id": t.id, "name": t.name, "arguments": t.arguments}
                           for t in m.tool_calls], ensure_ascii=False) if m.tool_calls else None,
-                     m.tool_call_id, m.name, m.tokens_est or 0, _utcnow()))
+                     m.tool_call_id, m.name, m.tokens_est or 0, imgs, _utcnow()))
             self.conn.execute(
                 "INSERT INTO compaction_events (session_id, at_turn, trigger, before_tokens,"
                 " after_tokens, summary, created_at) VALUES (?,?,?,?,?,?,?)",

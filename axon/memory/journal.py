@@ -84,9 +84,15 @@ class Journal:
                     cleaned: list[str] | None = None,
                     archived: list | None = None) -> str:
         """生成本回合进度条目并追加；返回条目文本。"""
+        # v0.4.30：跳过系统观察消息（插嘴/验证/中断提示也是 user 角色）——
+        # 旧实现取"最后一条 user"，插嘴注入后进度日志的「请求」变成
+        # <user_interjection> 内容、「执行」变成 (无工具调用)
+        _INTERNAL = ("<user_interjection>", "<verification_failed>",
+                     "<interrupted_task>", "<resume_context>",
+                     "<tool_name_hint>", "<conversation_summary>")
         start = 0
         for i, m in enumerate(messages):
-            if m.role == "user":
+            if m.role == "user" and not str(m.content or "").startswith(_INTERNAL):
                 start = i
         turn_msgs = messages[start:]
 
@@ -95,9 +101,7 @@ class Journal:
         for m in turn_msgs:
             if m.role == "user" and m.content:
                 text = " ".join(str(m.content).split())
-                if (text.startswith("<resume_context>")
-                        or text.startswith("<verification")
-                        or text.startswith("<interrupted_task>")
+                if (text.startswith(_INTERNAL)
                         or "请为本次会话沉淀" in text[:200]):
                     continue        # 系统内部消息不算用户请求（v0.3.0）
                 user_input = text
@@ -121,7 +125,11 @@ class Journal:
                 et = (meta or {}).get("error_type")
                 if et:
                     name = short_tool_name(m.name or pending_name)
-                    hint = " ".join(str(m.content or "").split())[:120]
+                    # v0.4.29：先 unpack_meta 再截断——content 尾部带
+                    # <meta>{...}</meta>，旧实现把 JSON 噪声写进踩坑行
+                    from axon.agent.msgmeta import unpack_meta as _unpack
+                    plain, _ = _unpack(str(m.content or ""))
+                    hint = " ".join(plain.split())[:120]
                     failures.append(f"{name}: {hint}")
         ops_line = " · ".join(ops) if ops else "(无工具调用)"
 

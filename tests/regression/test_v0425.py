@@ -157,7 +157,7 @@ def test_unconfigured_image_gen_abandons(cfg):
     """未配置 → 放弃话术（不换模型硬凑）。"""
     r = _spec_of(cfg).handler(_Call(), {"prompt": "画一只猫"}, None)
     assert r.ok is False
-    assert r.error_type == "config"
+    assert r.error_type == "permanent"      # v0.4.29：config 归位四态 Literal
     assert "未配置生图模型" in r.recovery_hint
     assert "放弃生图任务" in r.recovery_hint
     assert "严禁" in r.recovery_hint                    # 禁止冒充生图

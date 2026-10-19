@@ -4,6 +4,7 @@ from __future__ import annotations
 import locale
 import os
 import subprocess
+from pathlib import Path
 
 from axon.sandbox.gateway import Action
 from axon.sandbox.risk import RiskClass
@@ -60,10 +61,25 @@ def make_spec(ctx: ToolContext) -> ToolSpec:
         timeout = int(args.get("timeout_sec", ctx.config.agent.tool_timeout_sec))
 
         # 纯删除命令 → 回收站（需求：删除优先移回收站；批量超阈值已在 CommandRule 升红审批）
+        import glob as _glob
         from axon.sandbox.backup import move_to_trash
         from axon.sandbox.destructive import parse_delete_command
-        paths = parse_delete_command(command)
-        if paths:
+        raw_paths = parse_delete_command(command)
+        if raw_paths:
+            # v0.4.29：glob 展开（`rm *.log` 旧实现把 '*.log' 当字面名 →
+            # exists() False → "未找到目标"静默不删）+ 去引号已在上游做
+            ws = Path(ctx.workspace)
+            paths: list[str] = []
+            for raw in raw_paths:
+                if raw.startswith("~"):
+                    raw = str(Path.home() / raw[2:]) if len(raw) > 2 \
+                        else str(Path.home())
+                p = Path(raw)
+                if any(ch in raw for ch in "*?["):
+                    pat = str(p if p.is_absolute() else ws / p)
+                    paths.extend(_glob.glob(pat, recursive=True))
+                else:
+                    paths.append(str(p if p.is_absolute() else (ws / p)))
             moved = move_to_trash(paths, ctx.config.trash_dir, ctx.workspace)
             for p in moved:
                 gw.note_subaction(Action(kind="fs_delete", target=p,
@@ -73,8 +89,12 @@ def make_spec(ctx: ToolContext) -> ToolSpec:
                 return tool_result_ok(
                     call, "已移入回收站:\n" + "\n".join(moved),
                     meta={"trashed": len(moved), "paths": moved})
-            return tool_result_ok(call, "未找到可删除的目标（路径不存在）",
-                                  meta={"trashed": 0})
+            # v0.4.29：paths 非空但没移成 → 明确报错（旧实现一律"路径不存在"，
+            # glob/带空格路径的真实删除被静默吞掉）
+            return tool_result_err(
+                call, "permanent",
+                "删除目标未找到（路径不存在或 glob 未命中）: "
+                + "、".join(raw_paths[:5]))
 
         try:
             proc = subprocess.run(

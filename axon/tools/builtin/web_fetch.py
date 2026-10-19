@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -20,6 +21,8 @@ from axon.sandbox.gateway import Action
 from axon.sandbox.risk import RiskClass
 from axon.tools.context import ToolContext
 from axon.tools.registry import ToolResult, ToolSpec, tool_result_err, tool_result_ok
+
+_SAVE_LOCK = threading.Lock()      # v0.4.29：并发下载落盘互斥（防同名覆盖）
 
 PARAMETERS = {
     "type": "object",
@@ -185,14 +188,48 @@ def make_spec(ctx: ToolContext) -> ToolSpec:
         except ImportError as e:
             return tool_result_err(call, "permanent",
                                    f"缺少依赖: {e}（pip install httpx）")
-        try:
-            resp = httpx.get(url, timeout=ctx.config.agent.web_timeout_sec,
-                             follow_redirects=True,
-                             headers={"User-Agent": "AXON/0.2 (+cli agent)"})
-        except Exception as e:
-            return tool_result_err(call, "transient", f"请求失败: {type(e).__name__}: {e}")
+        # v0.4.30：**手动逐跳**——旧实现 follow_redirects=True 一次性抓完
+        # 才复检，对内网/云元数据的副作用请求已经发出且 body 已下载。
+        # 现在每跳先过策略（domain_deny / 本地/私网 / 云元数据地址 / secret 扫描）。
+        from fnmatch import fnmatchcase
+        from axon.sandbox.network_policy import scan_secrets, _is_local
+        net = ctx.config.sandbox.network
+        _META_HOSTS = {"169.254.169.254", "metadata.google.internal",
+                       "100.100.100.200", "fd00:ec2::254"}
+        cur = url
+        resp = None
+        for _hop in range(6):
+            host = (urlsplit(cur).hostname or "").lower()
+            if host in _META_HOSTS:
+                return tool_result_err(call, "permanent",
+                                       f"拒绝访问云元数据地址：{cur}")
+            if net.domain_deny and any(fnmatchcase(host, p.lower())
+                                       for p in net.domain_deny):
+                return tool_result_err(call, "permanent",
+                                       f"域名在黑名单中：{cur}")
+            if net.secret_scan and scan_secrets(cur):
+                return tool_result_err(call, "permanent",
+                                       f"URL 含敏感信息，已阻断：{cur[:120]}")
+            try:
+                resp = httpx.get(cur, timeout=ctx.config.agent.web_timeout_sec,
+                                 follow_redirects=False,
+                                 headers={"User-Agent": "AXON/0.2 (+cli agent)"})
+            except Exception as e:
+                return tool_result_err(call, "transient",
+                                       f"请求失败: {type(e).__name__}: {e}")
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("location", "")
+                if not loc:
+                    break
+                cur = str(httpx.URL(cur).join(loc))
+                continue
+            break
+        else:
+            return tool_result_err(call, "permanent", "重定向次数过多（>5 跳），已中止")
+        if resp is None:
+            return tool_result_err(call, "transient", "请求未完成")
         if resp.status_code >= 400:
-            return tool_result_err(call, "transient", f"HTTP {resp.status_code}（{url}）")
+            return tool_result_err(call, "transient", f"HTTP {resp.status_code}（{cur}）")
 
         ctype = (resp.headers.get("content-type", "") or "").lower()
         cdisp = resp.headers.get("content-disposition", "") or ""
@@ -213,44 +250,51 @@ def make_spec(ctx: ToolContext) -> ToolSpec:
                 f"文件 {size / 1048576:.1f}MB 超过下载上限 "
                 f"{tools_cfg.max_download_mb}MB（可调 config tools.max_download_mb）")
 
-        risky = ext in {e.lower() for e in tools_cfg.risk_extensions}
-        if risky:
-            if gw is None or getattr(gw, "confirm", None) is None:
-                return tool_result_err(
-                    call, "permanent",
-                    f"风险类型文件（.{ext}）需要用户确认，当前环境不支持交互确认 → 已拒绝下载")
-            action = Action(kind="network", target=url,
-                            detail={"download": True, "file_type": ext,
-                                    "size_bytes": size},
-                            session_id=getattr(gw, "session_id", ""),
-                            turn=getattr(gw, "turn", 0))
-            ok = gw.confirm(action, f"下载风险类型文件（.{ext}，{size / 1048576:.2f}MB）："
-                                    f"{url}")
-            if not ok:
-                return tool_result_err(
-                    call, "permanent",
-                    f"用户拒绝下载风险类型文件（.{ext}）：{url}")
-
         # ---- 落盘（文件名优先级：save_as > Content-Disposition > URL 末段） ----
         raw_name = (str(args.get("save_as") or "")
                     or _disposition_filename(cdisp)
                     or os.path.basename(unquote(urlsplit(url).path))
                     or "download")
         name = _safe_name(raw_name, ext)
+        # v0.4.29 P1：风险门以**最终落盘名**的扩展名为准——旧实现只按推断 ext
+        # 判风险，save_as 可完全绕过（ext="" 时 save_as="x.bat" 无确认落盘；
+        # 反向 URL 是 .exe 确认后 save_as="x.pdf" 名实不符）
+        final_ext = os.path.splitext(name)[1].lstrip(".").lower()
+        risky = final_ext in {e.lower() for e in tools_cfg.risk_extensions} \
+            or ext in {e.lower() for e in tools_cfg.risk_extensions}
+        if risky:
+            if gw is None or getattr(gw, "confirm", None) is None:
+                return tool_result_err(
+                    call, "permanent",
+                    f"风险类型文件（.{final_ext or ext}）需要用户确认，"
+                    "当前环境不支持交互确认 → 已拒绝下载")
+            action = Action(kind="network", target=url,
+                            detail={"download": True, "file_type": final_ext or ext,
+                                    "size_bytes": size},
+                            session_id=getattr(gw, "session_id", ""),
+                            turn=getattr(gw, "turn", 0))
+            ok = gw.confirm(action, f"下载风险类型文件（.{final_ext or ext}，"
+                                    f"{size / 1048576:.2f}MB，将存为 {name}）：{url}")
+            if not ok:
+                return tool_result_err(
+                    call, "permanent",
+                    f"用户拒绝下载风险类型文件（.{final_ext or ext}）：{url}")
         out_dir = Path(ctx.workspace) / tools_cfg.downloads_dir
         out_dir.mkdir(parents=True, exist_ok=True)
-        target = out_dir / name
-        if target.exists():
-            stem, suffix = target.stem, target.suffix
-            i = 2
-            while target.exists():
-                target = out_dir / f"{stem}-{i}{suffix}"
-                i += 1
-        try:
-            target.write_bytes(resp.content)
-        except OSError as e:
-            return tool_result_err(call, "resource", f"写入失败: {e}")
-
+        # v0.4.29 P2：落盘临界区加锁——parallel_safe=True 的并发下载在同名
+        # 文件上 exists() 检查与写入之间无互斥 → 互相覆盖（下载物静默丢失）
+        with _SAVE_LOCK:
+            target = out_dir / name
+            if target.exists():
+                stem, suffix = target.stem, target.suffix
+                i = 2
+                while target.exists():
+                    target = out_dir / f"{stem}-{i}{suffix}"
+                    i += 1
+            try:
+                target.write_bytes(resp.content)
+            except OSError as e:
+                return tool_result_err(call, "resource", f"写入失败: {e}")
         sha = hashlib.sha256(resp.content).hexdigest()[:16]
         text = (
             f"已下载文件（{ext or 'binary'}，{size} 字节）\n"
