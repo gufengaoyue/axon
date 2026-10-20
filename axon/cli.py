@@ -41,8 +41,9 @@ HELP_TEXT = """\
   /save [补充说明]      沉淀项目记忆（调用模型总结本次会话，写入 AXON.md）
   /think [n|all]        回顾思考全文（v0.4.28）：默认最近 1 段，n=最近 n 段，
                         all=全部；长内容折叠（Ctrl+O / /verbose on 全显）
-  /delproj [项目]       删除项目（与命令行 `python -m axon --delproj [项目]` 等价）
-                        不带参数列出项目；需输入项目名确认（默认只删会话数据）
+  /delproj [项目|1,3-5|all]  删除项目（与命令行 `--delproj` 等价）
+                        不带参数列出项目；单个→输项目名确认，批量→输 DELETE 确认
+                        （默认只删会话数据；--with-files 移目录到回收站）
   /attach [路径]        附加图片/文件（不带参数读剪贴板）；截图/复制文件会被**自动收编**
                         收编到 <项目>/tmp/，提示中以 >./tmp/图片1.png 形式引用
   /sessions             列出最近会话（跨项目索引）
@@ -1300,45 +1301,53 @@ def run_delproj_mode(cfg, console, target: str, with_files: bool = False) -> int
     return 0
 
 
-def _cmd_delproj(app: dict, session, arg: str, out) -> object | None:
-    """`/delproj`：删除项目（v0.2.7）。破坏性操作 → 列表 / 强确认 / 回收站。
+def _expand_batch_tokens(token: str, projects: list[dict]) -> list[str]:
+    """v0.4.35：把批量选择展开为 token 列表。
 
-    用法：`/delproj`（列表）、`/delproj <项目目录|项目名|session前缀> [--with-files]`
-    安全约定：① 默认只删**会话数据**；② 必须手输项目名确认；③ `--with-files`
-    把项目目录移入回收站（二次确认），永不直接删除；④ 程序目录/盘根/用户根拒绝。
+    支持 `1,3,5`（逗号分隔，兼容中文逗号）、`1-5`（闭区间，可反序）、
+    `all` / `*`（全部），以及与名称混用（如 `1,Project3`）。去重保序。
+    """
+    import re as _re
+
+    raw = [x.strip() for x in str(token).replace("，", ",").split(",") if x.strip()]
+    out_tokens: list[str] = []
+    for part in raw:
+        if part.lower() in ("all", "*"):
+            out_tokens.extend(str(k) for k in range(1, len(projects) + 1))
+            continue
+        m = _re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > b:
+                a, b = b, a
+            out_tokens.extend(str(k) for k in range(a, b + 1))
+            continue
+        out_tokens.append(part)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for tk in out_tokens:
+        if tk.lower() not in seen:
+            seen.add(tk.lower())
+            uniq.append(tk)
+    return uniq
+
+
+def _match_project(projects: list[dict], token: str):
+    """匹配单个项目：返回 (target, candidates)。
+
+    (项目, []) = 唯一命中； (None, [候选...]) = 多义； (None, []) = 未找到。
+    匹配优先级：列表序号 → 目录 → 名称 → session 前缀 → 名称/目录模糊。
     """
     import os as _os
     from pathlib import Path as _P
 
-    store = app["store"]
-    cfg = app["cfg"]
-    projects = store.list_projects()
-
-    if not arg or arg == "--list":
-        if not projects:
-            out("(没有项目记录)")
-            return session
-        out("项目列表（用 --delproj <序号|名称|目录|session前缀> 删除；默认只删会话数据）：")
-        for i, pj in enumerate(projects, 1):
-            out(f"  {i:>2}. {pj['name']:<14} 会话 {pj['sessions']:>2} · 消息 "
-                f"{pj['messages']:>5} · 最近 {str(pj['last_updated'])[:16]}  "
-                f"[{pj['sid_prefix']}]  {pj['project_dir']}")
-        return session
-
-    with_files = "--with-files" in arg
-    token = arg.replace("--with-files", "").strip().strip('"').strip("'")
-    if not token:
-        out("用法: /delproj <项目目录|项目名|session前缀> [--with-files]")
-        return session
-
-    # ---- 匹配项目 ----
     target = None
     low = token.lower()
     if token.isdigit():                      # 按列表序号（同名项目时更方便）
         idx = int(token)
         if 1 <= idx <= len(projects):
             target = projects[idx - 1]
-        # 超出范围 → 不报错：session 前缀可能恰好全是数字（v0.4.3 修复），继续走前缀匹配
+        # 超出范围 → 继续走前缀匹配（session 前缀可能全是数字，v0.4.3）
     if target is None and (_os.sep in token or "/" in token or ":" in token):
         want = str(_P(token).resolve())
         for pj in projects:
@@ -1359,81 +1368,225 @@ def _cmd_delproj(app: dict, session, arg: str, out) -> object | None:
         cands = [pj for pj in projects
                  if pj["name"].lower().startswith(low) or low in pj["project_dir"].lower()]
         if len(cands) == 1:
-            target = cands[0]
-        elif len(cands) > 1:
-            out("匹配到多个项目，请用更精确的名称/目录：", style="yellow")
-            for pj in cands:
-                out(f"   {pj['name']}  {pj['project_dir']}")
+            return cands[0], []
+        if len(cands) > 1:
+            return None, cands
+    return target, []
+
+
+def _cmd_delproj(app: dict, session, arg: str, out) -> object | None:
+    """`/delproj`：删除项目（v0.2.7；v0.4.35 支持批量）。破坏性操作。
+
+    用法：
+      /delproj                                     列出项目
+      /delproj <序号|名称|目录|session前缀>         删除单个（输入项目名确认）
+      /delproj 1,3,5 | 1-5 | all [--with-files]    批量删除（输入 DELETE 确认）
+
+    安全约定：① 默认只删**会话数据**；② 单个 → 输入项目名，批量 → 输入 DELETE；
+    ③ `--with-files` 需**再次**输入 DELETE，且逐目录做守卫检查（盘根/用户根/
+    程序目录/工作空间拒绝），永不移除回收站外的东西；④ 批量中任一 token 未匹配
+    或存在多义 → **整体取消**（不做部分删除）；⑤ 批量时自动排除当前项目。
+    """
+    import os as _os
+    from pathlib import Path as _P
+
+    store = app["store"]
+    cfg = app["cfg"]
+    projects = store.list_projects()
+
+    if not arg or arg == "--list":
+        if not projects:
+            out("(没有项目记录)")
             return session
-    if target is None:
-        out(f"未找到项目: {token}（/delproj 查看列表）", style="yellow")
+        out("项目列表（默认只删会话数据）：")
+        for i, pj in enumerate(projects, 1):
+            out(f"  {i:>2}. {pj['name']:<14} 会话 {pj['sessions']:>2} · 消息 "
+                f"{pj['messages']:>5} · 最近 {str(pj['last_updated'])[:16]}  "
+                f"[{pj['sid_prefix']}]  {pj['project_dir']}")
+        out("  单个：/delproj <序号|名称|目录|session前缀>")
+        out("  批量：/delproj 1,3,5 · /delproj 1-5 · /delproj all  [--with-files]",
+            style="dim")
         return session
 
-    name = target["name"]
-    is_current = _os.path.normcase(target["project_dir"]) == _os.path.normcase(
-        str(cfg.project))
-    out(f"目标项目：{name}")
-    out(f"  目录：{target['project_dir']}")
-    out(f"  会话 {target['sessions']} 个 · 消息 {target['messages']} 条")
-    if is_current:
-        out("  ⚠ 这是**当前项目**：删除后当前会话即消失，需要重启。", style="yellow")
+    with_files = "--with-files" in arg
+    token = arg.replace("--with-files", "").strip().strip('"').strip("'")
+    if not token:
+        out("用法: /delproj <序号|名称|目录|session前缀|1,3-5|all> [--with-files]")
+        return session
+
+    # ---- 展开 + 逐个匹配（任一失败 → 整体取消）----
+    tokens = _expand_batch_tokens(token, projects)
+    targets: list[dict] = []
+    misses: list[str] = []
+    multi: list = []
+    seen_dirs: set[str] = set()
+    for tk in tokens:
+        tgt, cands = _match_project(projects, tk)
+        if cands:
+            multi.append((tk, cands))
+            continue
+        if tgt is None:
+            misses.append(tk)
+            continue
+        key = str(tgt["project_dir"]).lower()
+        if key in seen_dirs:
+            continue                          # 同一项目被多种形式命中 → 去重
+        seen_dirs.add(key)
+        targets.append(tgt)
+
+    if multi:
+        out("匹配到多个项目，请用更精确的名称/目录（本次未删除任何内容）：", style="yellow")
+        for tk, cands in multi:
+            out(f"  「{tk}」的候选：")
+            for pj in cands:
+                out(f"     {pj['name']}  {pj['project_dir']}")
+        return session
+    if misses:
+        out(f"未找到项目: {', '.join(misses)}（/delproj 查看列表）", style="yellow")
+        if targets:
+            out("批量删除要求全部命中——本次未删除任何内容（避免部分删除）",
+                style="yellow")
+        return session
+    if not targets:
+        out("没有可删除的项目", style="yellow")
+        return session
+
+    # ---- 批量语义：自动排除当前项目 ----
+    is_batch = len(targets) > 1
+    if is_batch:
+        cur = _os.path.normcase(str(cfg.project))
+        skipped = [t for t in targets if _os.path.normcase(t["project_dir"]) == cur]
+        if skipped:
+            out(f"（已自动排除当前项目「{skipped[0]['name']}」——删除它会中断当前会话）",
+                style="yellow")
+        targets = [t for t in targets
+                   if _os.path.normcase(t["project_dir"]) != cur]
+        if not targets:
+            out("没有可删除的项目", style="yellow")
+            return session
+
+    n = len(targets)
+    # ---- 清单 ----
+    if is_batch:
+        out(f"将删除以下 {n} 个项目（**只删会话数据**，磁盘文件不受影响）：")
+        for i, t in enumerate(targets, 1):
+            out(f"  {i:>2}. {t['name']}  会话 {t['sessions']} · 消息 {t['messages']}  "
+                f"[{t['sid_prefix']}]  {t['project_dir']}")
+    else:
+        t = targets[0]
+        out(f"目标项目：{t['name']}")
+        out(f"  目录：{t['project_dir']}")
+        out(f"  会话 {t['sessions']} 个 · 消息 {t['messages']} 条")
+        if _os.path.normcase(t["project_dir"]) == _os.path.normcase(str(cfg.project)):
+            out("  ⚠ 这是**当前项目**：删除后当前会话即消失，需要重启。", style="yellow")
     out("  默认只删除会话数据（数据库记录），磁盘文件不受影响；"
         "加 --with-files 会把项目目录移入回收站。", style="dim")
     out("  此操作不可撤销（会话数据无备份）。", style="yellow")
 
+    # ---- 确认（单个=项目名；批量=DELETE）----
     try:
-        typed = input(f"  请输入项目名「{name}」以确认删除: ").strip()
+        if is_batch:
+            typed = input(f"  批量删除 {n} 个项目，输入 DELETE 继续: ").strip()
+            ok = typed == "DELETE"
+        else:
+            typed = input(f"  请输入项目名「{targets[0]['name']}」以确认删除: ").strip()
+            ok = typed == targets[0]["name"]
     except (EOFError, KeyboardInterrupt):
         print()
         out("已取消", style="dim")
         return session
-    if typed != name:
-        out("名称不匹配，已取消", style="yellow")
+    if not ok:
+        out("确认不匹配，已取消", style="yellow")
         return session
 
-    stats = store.delete_project_data(target["project_dir"])
-    try:
-        app["audit"].record(
-            __import__("axon.sandbox.gateway", fromlist=["Action"]).Action(
-                kind="fs_delete", target=target["project_dir"],
-                detail={"scope": "project_sessions", "stats": stats},
-                session_id=getattr(session, "id", "") or "", turn=0),
-            "allow", "project_delete:data", "ok")
-    except Exception:
-        pass
-    out(f"已删除会话数据：会话 {stats['sessions']} · 消息 {stats['messages']} · "
-        f"压缩记录 {stats['events']} · 审计 {stats['audit']}")
+    # ---- 逐个删除会话数据 ----
+    total = {"sessions": 0, "messages": 0, "events": 0, "audit": 0}
+    done: list[dict] = []
+    for t in targets:
+        try:
+            stats = store.delete_project_data(t["project_dir"])
+        except Exception as e:  # noqa: BLE001 - 单个失败不影响其余
+            out(f"  ✗ {t['name']}：删除失败（{type(e).__name__}: {e}）", style="red")
+            continue
+        for k in total:
+            total[k] += int(stats.get(k, 0) or 0)
+        try:
+            app["audit"].record(
+                Action(kind="fs_delete", target=t["project_dir"],
+                       detail={"scope": "project_sessions", "stats": stats},
+                       session_id=getattr(session, "id", "") or "", turn=0),
+                "allow", "project_delete:data", "ok")
+        except Exception:
+            pass
+        done.append(t)
+        if is_batch:
+            out(f"  ✓ {t['name']}：会话 {stats['sessions']} · 消息 {stats['messages']}")
 
-    # ---- 可选：项目目录移入回收站（二次确认） ----
-    if with_files:
-        pdir = _P(target["project_dir"])
+    label = f"已删除 {len(done)}/{n} 个项目的会话数据" if is_batch else "已删除会话数据"
+    out(f"{label}：会话 {total['sessions']} · 消息 {total['messages']} · "
+        f"压缩记录 {total['events']} · 审计 {total['audit']}")
+
+    # ---- 可选：项目目录移入回收站（二次确认 + 逐目录守卫）----
+    if with_files and done:
         from axon.config import program_dir, program_root
+        from axon.sandbox.backup import move_to_trash
         guards = {str(_P(_P.cwd().anchor).resolve()), str(_P.home()),
                   str(program_dir()), str(program_root())}
         wp = _P(cfg.workspace).resolve()
-        if str(pdir.resolve()) in guards or pdir.resolve() == wp \
-                or pdir.resolve() in wp.parents or wp in pdir.resolve().parents:
-            out("拒绝：目标是盘根/用户根/程序目录/工作空间，不能移入回收站", style="red")
-            return session
-        try:
-            typed2 = input(
-                f"  再次确认：把 {pdir} **整个目录**移入回收站？输入 DELETE 继续: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            out("已取消（会话数据已删除）", style="dim")
-            return session
-        if typed2 != "DELETE":
-            out("已取消文件删除（会话数据已删除）", style="dim")
-            return session
-        from axon.sandbox.backup import move_to_trash
-        moved = move_to_trash([str(pdir)], cfg.trash_dir, cfg.workspace)
-        out(f"已移入回收站：{moved[0] if moved else '(未移动)'}")
 
-    if is_current:
-        out("当前项目已被删除，请重启 AXON（或 --project 指定其他项目）。", style="yellow")
-        return None
+        def _blocked_reason(pdir: _P) -> str | None:
+            try:
+                rp = pdir.resolve()
+            except OSError as e:
+                return f"路径无法解析（{e}）"
+            if str(rp) in guards or rp == wp or rp in wp.parents or wp in rp.parents:
+                return "目标是盘根/用户根/程序目录/工作空间"
+            return None
+
+        movable: list[dict] = []
+        for t in done:
+            why = _blocked_reason(_P(t["project_dir"]))
+            if why:
+                # 保留"拒绝"措辞（v0.2.8 起的既有语义，文档/测试均以此为准）
+                out(f"  拒绝：{t['name']} —— {why}（会话数据已删除，目录保留）",
+                    style="yellow")
+            else:
+                movable.append(t)
+
+        if movable:
+            try:
+                if is_batch:
+                    prompt2 = (f"  再次确认：把以上 {len(movable)} 个**整个目录**"
+                               "移入回收站？输入 DELETE 继续: ")
+                else:
+                    prompt2 = (f"  再次确认：把 {movable[0]['project_dir']} "
+                               "**整个目录**移入回收站？输入 DELETE 继续: ")
+                typed2 = input(prompt2).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                out("已取消文件删除（会话数据已删除）", style="dim")
+                return session
+            if typed2 != "DELETE":
+                out("已取消文件删除（会话数据已删除）", style="dim")
+                return session
+            moved_n = 0
+            for t in movable:
+                moved = move_to_trash([t["project_dir"]], cfg.trash_dir, cfg.workspace)
+                if moved:
+                    moved_n += 1
+                    out(f"  已移入回收站：{moved[0]}")
+                else:
+                    out(f"  ⚠ 未能移动：{t['project_dir']}", style="yellow")
+            out(f"已移入回收站 {moved_n}/{len(movable)} 个目录")
+
+    # ---- 当前项目被删（仅单目标显式指定；批量已排除）----
+    if not is_batch:
+        t = targets[0]
+        if _os.path.normcase(t["project_dir"]) == _os.path.normcase(str(cfg.project)):
+            out("当前项目已被删除，请重启 AXON（或 --project 指定其他项目）。",
+                style="yellow")
+            return None
     return session
-
 
 def _mark_ended(app: dict, session) -> None:
     """正常退出标记（v0.2.9：用于下次启动识别"异常结束"的会话）。"""
@@ -2254,6 +2407,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--delproj", nargs="?", const="__list__", default=None,
                         metavar="项目",
                         help=("删除项目（匹配目录/名称/会话前缀；不带值列出项目）。"
+                              "支持批量：`--delproj 1,3,5`、`--delproj 1-5`、"
+                              "`--delproj all`（批量需输入 DELETE 确认）。"
                               "不需要 API key、不进 REPL，可在任意目录运行；"
                               "默认只删会话数据，配 --with-files 把项目目录移入回收站"))
     parser.add_argument("--with-files", action="store_true",
