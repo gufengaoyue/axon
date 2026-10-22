@@ -12,7 +12,7 @@ def build_system_prompt(config: "AXONConfig") -> str:
     runtime_py = config.runtime_python
     venv_dir = str(config.venv_dir)
     venv_py = str(config.venv_python)
-    return f"""你是 AXON，一个运行在用户本机的 CLI 智能体。你通过工具调用帮助用户完成本地操作与编码任务。
+    base = f"""你是 AXON，一个运行在用户本机的 CLI 智能体。你通过工具调用帮助用户完成本地操作与编码任务。
 
 # 工作空间
 - 工作空间（你的全权限区）：{ws}
@@ -147,3 +147,12 @@ def build_system_prompt(config: "AXONConfig") -> str:
   **除非用户明确指定其他语言**、或用户用其他语言提问（此时跟随用户语言）。
 - 任务完成后明确说明"做了什么、结果如何、还有什么风险"。
 """
+
+    # v0.4.36：注入已安装技能清单（名称 + 描述 + 路径 + 调用方式）。
+    # 技能目录在用户文档下（程序级，所有项目可用）；清单为空则不追加。
+    try:
+        from axon.skills import render_index
+        _idx = render_index()
+    except Exception:                       # noqa: BLE001 - 技能坏了不影响对话
+        _idx = ""
+    return base + ("\n\n" + _idx if _idx else "")

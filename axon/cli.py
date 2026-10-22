@@ -51,9 +51,16 @@ HELP_TEXT = """\
   /verbose [on|off]     详细模式：长内容全显/折叠（等同 Ctrl+O；v0.4.13）
   /compact              手动触发一次结构化压缩（openai 路）
   /memory               查看记忆（长期记忆 + 项目记忆 + 进度日志）
+  /skills [remove 名称] 列出已安装技能 / 卸载（移入回收站）；
+                        安装用 `axon --add-skill <技能包.zip>`
   /audit [--export csv|json <路径>]   查看/导出审计日志
   /exit                 退出（Ctrl+D 同效；退出前会自动沉淀项目记忆）
-直接输入自然语言即与 agent 对话。执行中 Ctrl+C 中断当前回合。"""
+直接输入自然语言即与 agent 对话。执行中 Ctrl+C 中断当前回合。
+
+技能（skills）：
+  &名称                 加载技能（如 `&quota-sampling 帮我抽 100 户`），
+                        也可直接说「使用技能 名称」；输入 `&` 会弹出技能列表
+  安装：axon --add-skill <技能包.zip>   （检查通过后存到 <个人文档>/.axon/skills/）"""
 
 SUMMARY_PROMPT = """\
 请为本次会话沉淀「项目记忆」——目的是让**后续会话**能快速理解这个项目的内容、逻辑与进度。
@@ -1069,6 +1076,14 @@ def _compose_user_input(app: dict, text: str, session=None) -> str:
     对旧会话跑 _run_turn）会抢先 pop 掉当前会话的 note，导致 resume 首轮
     丢失上下文、"断点续做"失效。note 只属于设置时登记的那个 session。
     """
+    # v0.4.36：技能调用（`&name` / 「使用技能 name」）→ 注入 <skill> 块。
+    # 放在最前：技能是"指令层"，应优先于 resume 背景与用户原文。
+    try:
+        from axon import skills as _skills
+        text, _used = _skills.expand_invocation(text)
+    except Exception:                       # noqa: BLE001 - 技能坏了不影响正常对话
+        pass
+
     note = app.get("pending_resume_note")
     if not note:
         return text
@@ -1273,6 +1288,63 @@ def run_repair_mode(cfg, console) -> int:
         f"压缩记录 {result.get('compaction_events')} · 审计 {result.get('audit_log')}")
     say(f"  原库备份: {result.get('backup')}")
     return 0
+
+
+def run_add_skill_mode(console, zip_paths: list[str], force: bool = False,
+                       assume_yes: bool = False) -> int:
+    """`--add-skill <zip>`：检查 → 确认 → 安装（v0.4.36）。
+
+    不需要 API key、不进 REPL。检查项见 `axon.skills.inspect_zip`：
+    包完整性 / 路径安全（穿越、绝对路径、符号链接）/ 结构（必须有 SKILL.md）/
+    文件类型（二进制拒绝、脚本告警）/ 内容体检（危险命令告警、凭据硬拦）。
+    """
+    from axon import skills
+
+    def out(text, style: str = "") -> None:
+        if console is not None:
+            console.print(str(text), style=style, markup=False)
+        else:  # pragma: no cover
+            print(text)
+
+    rc = 0
+    for raw in zip_paths:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        out(f"=== 检查 {p} ===")
+        rep = skills.inspect_zip(p)
+        for line in rep.summary_lines():
+            out(line)
+        if not rep.ok:
+            out("检查未通过 → 未安装", style="red")
+            rc = 1
+            continue
+        if rep.warnings and not assume_yes:
+            # v0.4.36：非交互（脚本/管道）下不能等确认——没有 --yes 就拒绝，
+            # 避免 `axon --add-skill x.zip` 在 CI 里永久挂起
+            if not sys.stdin.isatty():
+                out("存在警告且未指定 --yes（非交互模式）→ 未安装", style="yellow")
+                rc = 1
+                continue
+            try:
+                ans = input("  存在上述警告，仍要安装？输入 y 继续: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                out("已取消", style="dim")
+                rc = 1
+                continue
+            if ans not in ("y", "yes"):
+                out("已取消", style="dim")
+                rc = 1
+                continue
+        ok, msg, rep2 = skills.install_zip(p, force=force)
+        out(("✓ " if ok else "✗ ") + msg, style=("green" if ok else "red"))
+        if ok:
+            out(f"  调用：&{rep2.name}   或   「使用技能 {rep2.name}」", style="dim")
+            out(f"  目录：{skills.skills_root() / rep2.name}", style="dim")
+        else:
+            rc = 1
+    return rc
 
 
 def run_delproj_mode(cfg, console, target: str, with_files: bool = False) -> int:
@@ -1863,6 +1935,7 @@ SLASH_COMMANDS = [
     ("/save", "立即沉淀项目记忆"),
     ("/think", "回顾思考全文（n=最近n段 / all=全部）"),
     ("/attach", "附加图片/文件（读剪贴板或路径）"),
+    ("/skills", "列出已安装技能（/skills remove 名称 卸载）"),
     ("/sessions", "列出最近会话（跨项目）"),
     ("/resume", "恢复会话"),
     ("/memory", "查看三层记忆"),
@@ -1974,7 +2047,26 @@ def _make_completers(state: dict):
             for sub in self.subs:
                 yield from sub.get_completions(document, complete_event)
 
-    return MergedCompleter(SlashCompleter(), RefCompleter())
+    class SkillCompleter(Completer):
+        """v0.4.36：行首 `&` → 已安装技能名。"""
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            if not text.startswith("&") or " " in text:
+                return
+            from axon import skills as _skills
+            typed = text[1:].strip().lower()
+            try:
+                items = _skills.list_skills()
+            except Exception:                   # noqa: BLE001
+                return
+            for s in items:
+                if not typed or typed in s.name.lower():
+                    desc = (s.description or "")[:30]
+                    yield Completion("&" + s.name, start_position=-len(text),
+                                     display="&" + s.name + ("  " + desc if desc else ""))
+
+    return MergedCompleter(SlashCompleter(), RefCompleter(), SkillCompleter())
 
 
 def _paste_from_clipboard(state: dict, event) -> None:
@@ -2357,6 +2449,30 @@ def handle_slash(app: dict, session, line: str, state: dict, ps) -> object | Non
                 session.id, store.load_messages(session.id),
                 app["loop"]._summarize, store)
             out("已执行结构化压缩")
+    elif cmd == "/skills":
+        from axon import skills as _skills
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if arg.lower() in ("remove", "rm", "uninstall", "卸载"):
+            name = parts[2].strip() if len(parts) > 2 else ""
+            if not name:
+                out("用法: /skills remove <名称>")
+            else:
+                ok, msg = _skills.uninstall(name)
+                out(msg, style="green" if ok else "yellow")
+        else:
+            items = _skills.list_skills()
+            root = _skills.skills_root()
+            if not items:
+                out("(还没有安装技能)")
+                out("安装：axon --add-skill <技能包.zip>", style="dim")
+                out(f"目录：{root}", style="dim")
+            else:
+                out(f"已安装技能（{len(items)} 个）——目录：{root}")
+                for s in items:
+                    ver = f" v{s.version}" if s.version else ""
+                    out(f"  {s.name:<22}{ver:<8} {(s.description or '(无描述)')[:56]}")
+                out("调用：&名称   或   「使用技能 名称」；卸载：/skills remove <名称>",
+                    style="dim")
     elif cmd == "/memory":
         entries = memory.entries()
         notes = memory.project_notes()
@@ -2404,6 +2520,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repair-db", action="store_true",
                         help=("检测并修复会话数据库（损坏时自动备份坏库并尽力重建；"
                               "不需要 API key）"))
+    parser.add_argument("--add-skill", action="append", default=None,
+                        metavar="SKILL.zip",
+                        help=("安装技能包（zip，必须含 SKILL.md）；可重复指定多个。"
+                              "检查：包完整性/路径安全/文件类型/危险命令/凭据；"
+                              "有警告需输入 y 确认。安装到 <个人文档>/.axon/skills/"))
+    parser.add_argument("--force", action="store_true",
+                        help="配合 --add-skill：覆盖已存在的同名技能")
+    parser.add_argument("--yes", "-y", action="store_true", dest="yes",
+                        help="配合 --add-skill：跳过警告确认（非交互/脚本安装）")
     parser.add_argument("--delproj", nargs="?", const="__list__", default=None,
                         metavar="项目",
                         help=("删除项目（匹配目录/名称/会话前缀；不带值列出项目）。"
@@ -2444,6 +2569,11 @@ def main(argv: list[str] | None = None) -> int:
         status.image_model = str(_ig.model)
     # v0.4.28：双行状态行默认关（见 StatusLine._start 注释；可配置开回）
     status.two_line_status = bool(getattr(cfg.agent, "two_line_status", False))
+
+    # --add-skill：最优先处理——装技能不需要模型/库（v0.4.36）
+    if args.add_skill:
+        return run_add_skill_mode(console, args.add_skill, force=args.force,
+                                  assume_yes=args.yes)
 
     # --repair-db：最优先处理——库坏了也要能修（v0.4.3）
     if args.repair_db:

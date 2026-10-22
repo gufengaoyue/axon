@@ -5,7 +5,7 @@
 <p align="center">  
   <a href="https://github.com/gufengaoyue/axon"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-gufengaoyue%2Faxon-181717?logo=github"></a>  
   <a href="https://pypi.org/project/ai-agent-axon/"><img alt="PyPI" src="https://img.shields.io/badge/PyPI-ai--agent--axon-3775A9?logo=pypi\&logoColor=white"></a>  
-  <img alt="version" src="https://img.shields.io/badge/version-0.4.35-blue">  
+  <img alt="version" src="https://img.shields.io/badge/version-0.4.36-blue">  
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB">  
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey">  
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">  
@@ -60,6 +60,7 @@ Axon 是一个**在你的电脑上本地运行**的 AI 智能体。它不是一�
 | 🧷 **跨回合去重**        | 流式文本五道防线（增量/累积/前缀重放/**整段重放 rfind 探测**/尾部重叠），修复 client 模式下的整页重放                                                                                                                                                                 |                                                   |
 | 📏 **流式限行**         | 思考流 ≤4 行、正文流 ≤30 行（超出静默累积 + 折叠提示，`Ctrl+O` 详细模式全显），防「内心独白」霸屏                                                                                                                                                                    |                                                   |
 | 💬 **插嘴即时生效**       | **模态输入**（v0.4.31）：执行中（含思考）按 `Enter` 唤起 `⌨ 插嘴>` 独占输入行 → 输入 → `Enter` 确认 / `Esc` 取消 / 空白确认=取消；编辑期间工具结果打印到输入行**上方**，思考框内输入行并入面板底部（不与 Live 抢终端）；确认后经 prompt 流式通道**立即注入**，智能体在**下一个动作前**确认并重新规划；`agent.stream_interject` 可回退旧行为     |                                                   |
+| 🧩 **技能（skills）** | 把固定打法打包成 zip（含 `SKILL.md`）→ `--add-skill`（含 `--yes` 非交互）检查后装到 `<个人文档>/.axon/skills/`（程序级、所有项目可用）；`&名称` 或「使用技能 名称」加载，`/skills` 管理；检查含路径穿越/二进制/凭据/危险命令 |
 | ⚡ **并行执行**          | 底层 CLI **默认并发执行**同一条消息里的多个工具调用（已实证）；提示词引导模型把无依赖子任务放进同消息（3–5 个），有依赖的步骤等上游结果；**并发审批互斥锁**保证多个「询问」不错串（防误批准）                                                                                                                        |                                                   |
 | 🧠 **思考可见**         | 模型的思考/决策过程实时呈现（`💭` 前缀 + 弱化样式，穿插在工具调用之间）；codebuddy 路取 SDK `ThinkingBlock`（**流式**：SSE thinking_delta 逐字播出），openai 路取 `reasoning_content`；过长自动折叠首尾；`agent.show_thinking` 可关                                                      |                                                   |
 | 📊 **可观测**          | 状态行（转圈 + 计时 + 操作概要轮换）、工具行动线、审计日志 `/audit` 与导出                                                                                                                                                                                  |                                                   |
@@ -162,6 +163,7 @@ Axon 会：搜索文件 → 逐个阅读 → 给出总结，并把这次交互�
 | `--base-url URL`               | 临时覆盖当前 provider 的 API 端点（v0.4.26；openai 路生效，换服务商试模型不必改 config.yml） |
 | `--resume [ID\|last]`          | 恢复会话；不带值则列出最近会话供选择（**跨项目生效**）                                      |
 | `--delproj [项目|1,3-5|all]`     | 删除项目（列出 / 序号 / 名称 / 目录 / session 前缀）；**支持批量**：`1,3,5`、`1-5`、`all`；`--with-files` 连目录移入回收站 |
+| `--add-skill SKILL.zip`          | 安装技能包（可重复；需含 `SKILL.md`）。检查：完整性/路径安全/文件类型/危险命令/凭据；有告警需输 `y`；`--force` 覆盖同名 |
 | `--repair-db`                  | 检测并修复会话数据库（损坏时自动备份坏库、按 schema 重建、逐行救回；不需要 API key）                 |
 | `-p "任务"`                      | 非交互单发：跑完一个任务就退出                                                    |
 | `--max-turns N`                | 单回合最大轮次                                                            |
@@ -181,6 +183,7 @@ Axon 会：搜索文件 → 逐个阅读 → 给出总结，并把这次交互�
 | `/audit [--export csv\|json <路径>]` | 查看 / 导出审计日志                              |
 | `/compact`                         | 手动压缩上下文（openai 路）                        |
 | `/delproj [项目|1,3-5|all]`          | 删除项目（等价于命令行 `--delproj`，支持批量删除）      |
+| `/skills [remove 名称]`             | 列出已安装技能 / 卸载（移入回收站）；`&名称` 加载技能 |
 | `/exit`                            | 退出（退出前自动沉淀项目记忆）                          |
 
 **运行中**：`Ctrl+C` 中断当前回合；直接打字 = 插嘴（回合结束后确认发送）。
